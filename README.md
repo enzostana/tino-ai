@@ -42,7 +42,7 @@ São **16 intenções** distintas reconhecidas a partir de texto livre.
 
 O bot funciona em **dois modos**:
 
-- **IA (padrão)** — usa o gateway OpenCode (`opencode.ai/zen/go/v1`) com o modelo `deepseek-v4-flash` (assinatura Go, custo fixo e super econômico) para interpretar mensagens em linguagem natural e extrair o JSON da intenção.
+- **IA (padrão)** — usa o gateway OpenCode (`opencode.ai/zen/go/v1`) com o modelo `mimo-v2.5` (assinatura Go, custo fixo e super econômico) para interpretar mensagens em linguagem natural e extrair o JSON da intenção.
 - **Regras locais (fallback)** — motor de regex em Python que reconhece as 16 intenções sem custo e sem internet. Ativa automaticamente se a IA falhar ou se nenhuma chave estiver configurada.
 
 ## Arquitetura
@@ -62,7 +62,7 @@ flowchart LR
 O fluxo de uma mensagem:
 
 1. **Evolution API** recebe a mensagem no WhatsApp e faz um `POST` no endpoint `/webhook` com o payload JSON do evento `messages.upsert` (texto em `data.message.conversation` / `extendedTextMessage`, remetente em `data.key.remoteJid`).
-2. A **camada de interpretação** decide a intenção: pela **API do gateway OpenCode** (`deepseek-v4-flash`) com um system prompt que define as 16 intenções e força saída em JSON puro, ou, se indisponível, pelas **regras locais**.
+2. A **camada de interpretação** decide a intenção: pela **API do gateway OpenCode** (`mimo-v2.5`) com um system prompt que define as 16 intenções e força saída em JSON puro, ou, se indisponível, pelas **regras locais**.
 3. O **roteador de intenção** despacha pro handler correspondente, que executa a lógica de negócio e as operações no banco.
 4. O **banco** PostgreSQL é acessado via `psycopg2` (pool de conexões), com filtros por telefone para isolar os dados de cada usuário.
 5. A resposta é enviada de volta pelo **Evolution API** via `POST /message/sendText/{instancia}`.
@@ -74,7 +74,7 @@ O telefone do remetente funciona como chave de particionamento: toda consulta fi
 | Camada | Tecnologia |
 |--------|------------|
 | API | FastAPI + Uvicorn |
-| Interpretação | Gateway OpenCode (deepseek-v4-flash) + fallback por regras (regex) |
+| Interpretação | Gateway OpenCode (mimo-v2.5) + fallback por regras (regex) |
 | Banco de dados | PostgreSQL 16 (Docker) |
 | Mensageria | Evolution API (WhatsApp) via Docker |
 | Cliente HTTP | httpx |
@@ -152,7 +152,7 @@ curl -X POST http://localhost:8000/webhook -H "Content-Type: application/json" -
 | `EVOLUTION_API_KEY` | Sim | Token de autenticação da Evolution API |
 | `POSTGRES_PASSWORD` | Sim | Senha do banco PostgreSQL |
 | `OPENCODE_API_KEY` | Não | Chave do gateway OpenCode (Zen/Go). Sem ela, o bot usa apenas as regras locais |
-| `OPENCODE_MODEL` | Não | Modelo no gateway (padrão: `deepseek-v4-flash`) |
+| `OPENCODE_MODEL` | Não | Modelo no gateway (padrão: `mimo-v2.5`) |
 | `OPENCODE_BASE_URL` | Não | Endpoint do gateway (padrão: `https://opencode.ai/zen/go/v1`) |
 
 ## Modelo de dados

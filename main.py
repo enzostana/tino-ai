@@ -16,7 +16,7 @@ app = FastAPI()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OPENCODE_API_KEY = os.getenv("OPENCODE_API_KEY", "")
-OPENCODE_MODEL = os.getenv("OPENCODE_MODEL", "deepseek-v4-flash")
+OPENCODE_MODEL = os.getenv("OPENCODE_MODEL", "mimo-v2.5")
 OPENCODE_BASE_URL = os.getenv("OPENCODE_BASE_URL", "https://opencode.ai/zen/go/v1")
 EVOLUTION_URL = os.getenv("EVOLUTION_URL", "").rstrip("/")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "")

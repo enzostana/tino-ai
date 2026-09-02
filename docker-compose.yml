@@ -47,7 +47,7 @@ services:
       - "8000:8000"
     environment:
       OPENCODE_API_KEY: ${OPENCODE_API_KEY}
-      OPENCODE_MODEL: ${OPENCODE_MODEL:-deepseek-v4-flash}
+      OPENCODE_MODEL: ${OPENCODE_MODEL:-mimo-v2.5}
       OPENCODE_BASE_URL: ${OPENCODE_BASE_URL:-https://opencode.ai/zen/go/v1}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       EVOLUTION_URL: http://evolution-api:8080
