@@ -240,7 +240,3 @@ A stack é 100% Docker e roda em qualquer VPS. Para expor o webhook publicamente
 - Gráficos mensais enviados como imagem
 - Suporte a áudio e foto de comprovante
 - Dashboard web
-
-## Agradecimentos
-
-Projeto derivado de [paylo-ai](https://github.com/joaomauricioporto/paylo-ai), de João Maurício Medeiros Porto. O Tino.IA substitui o Twilio/Supabase por Evolution API + PostgreSQL local e adiciona o modo de interpretação por regras.
