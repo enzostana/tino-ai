@@ -4,7 +4,12 @@ import anthropic
 import json
 import os
 import re
+import queue as fila_mod
+import threading
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import httpx
 import logging
 from decimal import Decimal
@@ -13,7 +18,11 @@ from psycopg2 import pool
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+FUSO = ZoneInfo("America/Sao_Paulo")
+
+def agora():
+    """Data/hora atual no fuso do Brasil."""
+    return datetime.now(FUSO)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OPENCODE_API_KEY = os.getenv("OPENCODE_API_KEY", "")
@@ -23,15 +32,28 @@ EVOLUTION_URL = os.getenv("EVOLUTION_URL", "").rstrip("/")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", "4"))
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 _db_pool = None
 
 def get_pool():
+    """Retorna o pool de conexões, recriando-o se estiver com problemas."""
     global _db_pool
     if _db_pool is None:
-        _db_pool = pool.ThreadedConnectionPool(1, 10, dsn=DATABASE_URL)
+        _db_pool = pool.ThreadedConnectionPool(2, 20, dsn=DATABASE_URL)
+    try:
+        conn = _db_pool.getconn()
+        _db_pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"Pool indisponível, recriando: {e}")
+        try:
+            _db_pool.closeall()
+        except Exception:
+            pass
+        _db_pool = pool.ThreadedConnectionPool(2, 20, dsn=DATABASE_URL)
     return _db_pool
 
 def query(sql, params=None):
@@ -59,14 +81,21 @@ def insert(sql, params):
 # ============================================================
 # WHATSAPP (EVOLUTION API)
 # ============================================================
-def enviar_whatsapp(telefone, texto):
-    try:
-        url = f"{EVOLUTION_URL}/message/sendText/{EVOLUTION_INSTANCE}"
-        headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
-        data = {"number": telefone, "text": texto}
-        httpx.post(url, headers=headers, json=data, timeout=20)
-    except Exception as e:
-        logger.error(f"Falha ao enviar WhatsApp para {telefone}: {e}")
+def enviar_whatsapp(telefone, texto, tentativas=2):
+    url = f"{EVOLUTION_URL}/message/sendText/{EVOLUTION_INSTANCE}"
+    headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
+    data = {"number": telefone, "text": texto}
+    for i in range(tentativas):
+        try:
+            r = httpx.post(url, headers=headers, json=data, timeout=20)
+            if r.status_code < 400:
+                return True
+            logger.warning(f"sendText status {r.status_code} para {telefone}")
+        except Exception as e:
+            logger.error(f"Falha ao enviar WhatsApp para {telefone} (tentativa {i + 1}): {e}")
+        if i < tentativas - 1:
+            time.sleep(2)
+    return False
 
 # ============================================================
 # HELPERS
@@ -81,7 +110,7 @@ def filtro_mes(hoje, offset=0):
     return f"{ano}-{mes:02d}"
 
 def buscar_gastos_periodo(telefone, periodo="mes"):
-    hoje = datetime.now()
+    hoje = agora()
     if periodo == "hoje":
         return query(
             "SELECT * FROM gastos WHERE telefone = %s AND data LIKE %s ORDER BY id DESC",
@@ -100,7 +129,7 @@ def buscar_gastos_periodo(telefone, periodo="mes"):
 
 def buscar_gastos_mes_offset(telefone, offset=0):
     """Busca gastos de um mês específico. offset=0 = mês atual, offset=1 = mês passado."""
-    prefixo = filtro_mes(datetime.now(), offset)
+    prefixo = filtro_mes(agora(), offset)
     return query(
         "SELECT * FROM gastos WHERE telefone = %s AND data LIKE %s ORDER BY id DESC",
         (telefone, f"{prefixo}%")
@@ -113,7 +142,7 @@ def salvar_gasto(descricao, valor, categoria, forma_pagamento, telefone):
     return insert(
         "INSERT INTO gastos (telefone, data, descricao, valor, categoria, forma_pagamento) "
         "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-        (telefone, datetime.now().strftime("%Y-%m-%d %H:%M"), descricao, valor, categoria, forma_pagamento)
+        (telefone, agora().strftime("%Y-%m-%d %H:%M"), descricao, valor, categoria, forma_pagamento)
     )
 
 def remover_ultimo_gasto(telefone):
@@ -157,11 +186,11 @@ def salvar_receita(descricao, valor, categoria, telefone):
     return insert(
         "INSERT INTO receitas (telefone, data, descricao, valor, categoria) "
         "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-        (telefone, datetime.now().strftime("%Y-%m-%d %H:%M"), descricao, valor, categoria)
+        (telefone, agora().strftime("%Y-%m-%d %H:%M"), descricao, valor, categoria)
     )
 
 def buscar_receitas_periodo(telefone, periodo="mes"):
-    hoje = datetime.now()
+    hoje = agora()
     if periodo == "hoje":
         return query(
             "SELECT * FROM receitas WHERE telefone = %s AND data LIKE %s ORDER BY id DESC",
@@ -589,7 +618,7 @@ def gerar_saldo(telefone, periodo):
     return "\n".join(linhas)
 
 def gerar_comparativo(telefone):
-    hoje = datetime.now()
+    hoje = agora()
     gastos_atual = buscar_gastos_mes_offset(telefone, 0)
     gastos_passado = buscar_gastos_mes_offset(telefone, 1)
 
@@ -652,7 +681,7 @@ def gerar_ver_lembretes(telefone):
     lembretes = buscar_lembretes(telefone)
     if not lembretes:
         return "📭 Nenhum lembrete cadastrado.\n\n💡 Adicione com: 'lembrete aluguel 1200 dia 5'"
-    hoje = datetime.now().day
+    hoje = agora().day
     linhas = ["🔔 *Contas fixas:*\n"]
     for l in lembretes:
         dia = l["dia_vencimento"]
@@ -720,6 +749,80 @@ def salvar_conversa(telefone, papel, conteudo):
         "(SELECT id FROM conversas WHERE telefone = %s ORDER BY id DESC LIMIT 50)",
         (telefone, telefone)
     )
+
+# ============================================================
+# DEDUP DE MENSAGENS
+# ============================================================
+_dedup_count = 0
+
+def mensagem_ja_processada(msg_id, telefone):
+    """Registra o id da mensagem. Retorna True se já foi processada antes."""
+    global _dedup_count
+    if not msg_id:
+        return False
+    resultado = query(
+        "INSERT INTO mensagens_processadas (id, telefone) VALUES (%s, %s) "
+        "ON CONFLICT (id) DO NOTHING RETURNING id",
+        (msg_id, telefone)
+    )
+    _dedup_count += 1
+    if _dedup_count % 100 == 0:
+        query("DELETE FROM mensagens_processadas WHERE criado_em < now() - interval '7 days'")
+    return not resultado
+
+# ============================================================
+# FILA DE PROCESSAMENTO
+# ============================================================
+fila = fila_mod.Queue(maxsize=500)
+_locks = {}
+_locks_guard = threading.Lock()
+
+def lock_usuario(telefone):
+    """Garante processamento sequencial por usuário (paralelo entre usuários)."""
+    with _locks_guard:
+        if telefone not in _locks:
+            _locks[telefone] = threading.Lock()
+        return _locks[telefone]
+
+def processar_item(telefone, nome, mensagem):
+    with lock_usuario(telefone):
+        eh_novo = registrar_usuario(telefone, nome)
+        atualizar_atividade(telefone, nome)
+        logger.info(f"Mensagem de {telefone} ({nome}): {mensagem}")
+        if eh_novo:
+            resposta = MENSAGEM_BEM_VINDO
+        else:
+            try:
+                resposta = agente_conversacional(telefone, mensagem)
+            except Exception as e:
+                logger.error(f"Agente falhou: {e}")
+                try:
+                    resposta = processar_mensagem(mensagem, telefone)
+                except Exception as e2:
+                    logger.error(f"Fallback falhou: {e2}")
+                    resposta = "⚠️ Não entendi sua mensagem.\n\nMande 'ajuda' para ver os comandos disponíveis."
+        salvar_conversa(telefone, "user", mensagem)
+        salvar_conversa(telefone, "assistant", resposta)
+    enviar_whatsapp(telefone, resposta)
+
+def worker():
+    while True:
+        item = fila.get()
+        try:
+            processar_item(*item)
+        except Exception as e:
+            logger.error(f"Worker: erro inesperado: {e}")
+        finally:
+            fila.task_done()
+
+@asynccontextmanager
+async def lifespan(_app):
+    for _ in range(NUM_WORKERS):
+        threading.Thread(target=worker, daemon=True).start()
+    logger.info(f"{NUM_WORKERS} workers iniciados")
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 # ============================================================
 # AJUDA
@@ -953,7 +1056,7 @@ def dados_ver_metas(telefone):
 
 def dados_ver_lembretes(telefone):
     lembretes = buscar_lembretes(telefone)
-    hoje = datetime.now().day
+    hoje = agora().day
     resultado = []
     for l in lembretes:
         dias = l["dia_vencimento"] - hoje
@@ -1212,6 +1315,9 @@ def obter_owner_jid():
 
 @app.post("/webhook")
 async def webhook(request: Request):
+    if WEBHOOK_TOKEN and request.headers.get("x-tino-token") != WEBHOOK_TOKEN:
+        return JSONResponse({"status": "não autorizado"}, status_code=403)
+
     try:
         payload = await request.json()
     except Exception:
@@ -1226,8 +1332,6 @@ async def webhook(request: Request):
     if not telefone:
         return {"status": "ignored"}
 
-    # Ignora mensagens enviadas pela própria instância, exceto auto-mensagens
-    # (chat "mensagens com você mesmo"), que são como o dono testa o bot.
     if key.get("fromMe"):
         owner = obter_owner_jid() or ""
         if telefone != owner.split("@")[0]:
@@ -1238,31 +1342,27 @@ async def webhook(request: Request):
         return {"status": "ignored"}
     mensagem = mensagem.strip()
 
+    msg_id = key.get("id", "")
+    if mensagem_ja_processada(msg_id, telefone):
+        return {"status": "duplicada"}
+
     nome = data.get("pushName", "")
-    eh_novo = registrar_usuario(telefone, nome)
-    atualizar_atividade(telefone, nome)
-
-    logger.info(f"Mensagem de {telefone} ({nome}): {mensagem}")
-
-    if eh_novo:
-        resposta = MENSAGEM_BEM_VINDO
-    else:
-        try:
-            resposta = agente_conversacional(telefone, mensagem)
-        except Exception as e:
-            logger.error(f"Agente falhou: {e}")
-            try:
-                resposta = processar_mensagem(mensagem, telefone)
-            except Exception as e2:
-                logger.error(f"Fallback falhou: {e2}")
-                resposta = "⚠️ Não entendi sua mensagem.\n\nMande 'ajuda' para ver os comandos disponíveis."
-
-    salvar_conversa(telefone, "user", mensagem)
-    salvar_conversa(telefone, "assistant", resposta)
-
-    enviar_whatsapp(telefone, resposta)
+    try:
+        fila.put_nowait((telefone, nome, mensagem))
+    except fila_mod.Full:
+        logger.error(f"Fila cheia, mensagem de {telefone} descartada")
+        return JSONResponse({"status": "fila cheia"}, status_code=503)
     return {"status": "ok"}
 
 @app.get("/")
-def health():
+def root():
     return {"status": "Tino.IA rodando! 🐙", "instancia": EVOLUTION_INSTANCE}
+
+@app.get("/health")
+def health():
+    try:
+        query("SELECT 1")
+        return {"status": "ok", "banco": "ok"}
+    except Exception as e:
+        logger.error(f"Health: banco indisponível: {e}")
+        return JSONResponse({"status": "erro", "banco": "indisponível"}, status_code=503)

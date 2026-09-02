@@ -127,7 +127,7 @@ curl -X POST http://localhost:8081/instance/create \
 # Configurar webhook
 curl -X POST http://localhost:8081/webhook/set/tino \
   -H "apikey: SEU_TOKEN" -H "Content-Type: application/json" \
-  -d '{"webhook":{"enabled":true,"url":"http://app:8000/webhook","events":["MESSAGES_UPSERT"],"byEvents":true}}'
+  -d '{"webhook":{"enabled":true,"url":"http://app:8000/webhook","events":["MESSAGES_UPSERT"],"byEvents":false,"headers":{"x-tino-token":"SEU_WEBHOOK_TOKEN"}}}'
 ```
 
 Pronto: mande "ajuda" para o seu próprio número e comece a registrar gastos.
@@ -147,6 +147,8 @@ curl -X POST http://localhost:8000/webhook -H "Content-Type: application/json" -
 }'
 ```
 
+> Se `WEBHOOK_TOKEN` estiver configurado, inclua o header `x-tino-token`.
+
 ## Variáveis de ambiente
 
 | Variável | Obrigatória | Descrição |
@@ -157,6 +159,20 @@ curl -X POST http://localhost:8000/webhook -H "Content-Type: application/json" -
 | `OPENCODE_API_KEY` | Não | Chave do gateway OpenCode (Zen/Go). Sem ela, o bot usa apenas as regras locais |
 | `OPENCODE_MODEL` | Não | Modelo no gateway (padrão: `mimo-v2.5`) |
 | `OPENCODE_BASE_URL` | Não | Endpoint do gateway (padrão: `https://opencode.ai/zen/go/v1`) |
+| `WEBHOOK_TOKEN` | Não | Segredo validado no header `x-tino-token` do webhook (recomendado em produção) |
+| `NUM_WORKERS` | Não | Threads de processamento em background (padrão: 4) |
+
+## Robustez
+
+- **Processamento em background** — o webhook valida, registra e enfileira a mensagem (resposta em milissegundos); 4 workers processam em paralelo. Um LLM lento não segura os demais usuários.
+- **Sequencial por usuário** — mensagens do mesmo número processam em ordem (lock por telefone); usuários diferentes rodam em paralelo.
+- **Dedup por ID** — reenvios da Evolution API são descartados (tabela `mensagens_processadas`, limpeza de 7 dias).
+- **Fuso Brasil** — todos os registros e relatórios usam `America/Sao_Paulo` ("hoje"/"semana" corretos para usuários BR).
+- **Token no webhook** — sem o header `x-tino-token` correto, a requisição é rejeitada (403).
+- **Healthcheck** — `/health` testa o banco e o Docker reinicia o app se ele ficar doente.
+- **Pool resiliente** — conexões do Postgres são recriadas automaticamente se o banco reiniciar.
+- **Retry no envio** — falha de `sendText` tenta 1 vez a mais antes de desistir.
+- **Backup diário** — `backup.sh` roda às 03:00 (cron), `pg_dump | gzip` em `/opt/backups/tino/` com retenção de 14 dias.
 
 ## Modelo de dados
 
