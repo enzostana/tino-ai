@@ -1,36 +1,21 @@
-# Paylo.IA 🐒
+# Tino.IA 🐙
 
-**Chatbot financeiro pessoal no WhatsApp.** Você manda "uber 27" e ele entende, categoriza e registra. Sem app, sem planilha, sem formulário — só a conversa.
-
-![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=flat&logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat&logo=fastapi&logoColor=white)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=flat&logo=postgresql&logoColor=white)
-![Supabase](https://img.shields.io/badge/Supabase-3FCF8E?style=flat&logo=supabase&logoColor=white)
-![Twilio](https://img.shields.io/badge/Twilio-F22F46?style=flat&logo=twilio&logoColor=white)
-![Render](https://img.shields.io/badge/Deploy-Render-46E3B7?style=flat&logo=render&logoColor=white)
-
----
-
-## O problema
-
-Controlar gasto exige disciplina que quase ninguém tem: abrir o app, achar a categoria, preencher o valor, salvar. Some o atrito e some o hábito.
-
-O Paylo.IA remove o atrito inteiro. O registro acontece onde você já está — no WhatsApp — e em linguagem natural. Não existe formulário, não existe menu, não existe sintaxe pra decorar.
+**Assistente financeiro pessoal via WhatsApp.** Você manda "uber 27" e ele entende, categoriza e registra. Sem app, sem planilha, sem formulário — só a conversa.
 
 ```
 Você:  almoço 32 no pix
-Paylo: ✅ Gasto registrado! (#184)
+Tino:  ✅ Gasto registrado! (#184)
        📌 Almoço
        💵 R$ 32.00
        🏷️ Alimentação
        💳 Pix
 
 Você:  meta alimentação 300
-Paylo: 🎯 Meta criada!
+Tino:  🎯 Meta criada!
        Alimentação: R$ 300.00/mês
 
 Você:  ifood 45
-Paylo: ✅ Gasto registrado! (#185)
+Tino:  ✅ Gasto registrado! (#185)
        📌 Ifood
        💵 R$ 45.00
        🏷️ Alimentação
@@ -53,40 +38,120 @@ Paylo: ✅ Gasto registrado! (#185)
 
 São **16 intenções** distintas reconhecidas a partir de texto livre.
 
+## Como funciona a interpretação
+
+O bot funciona em **dois modos**:
+
+- **Regras locais (padrão)** — motor de regex em Python que reconhece as 16 intenções sem custo e sem internet. Perfeito para uso pessoal.
+- **IA (opcional)** — se a variável `ANTHROPIC_API_KEY` estiver configurada, o Tino usa a API Claude (Anthropic) para interpretar mensagens mais complexas. Se a chamada falhar, cai automaticamente para as regras.
+
 ## Arquitetura
 
-```mermaid
+```
 flowchart LR
-    A["Usuário<br/>WhatsApp"] -->|mensagem| B[Twilio]
-    B -->|"POST /webhook"| C["FastAPI<br/>(Render)"]
-    C -->|interpreta| D["API Claude<br/>(Anthropic)"]
+    A["Usuário<br/>WhatsApp"] -->|mensagem| B["Evolution API<br/>(Docker)"]
+    B -->|"POST /webhook (JSON)"| C["Tino.IA<br/>FastAPI (Docker)"]
+    C -->|interpreta| D["Claude API<br/>(opcional)"]
     D -->|"JSON estruturado"| C
-    C -->|"CRUD via REST"| E[("PostgreSQL<br/>Supabase")]
+    C -->|"psycopg2"| E[("PostgreSQL<br/>(Docker)")]
     E -->|dados| C
-    C -->|TwiML| B
+    C -->|"POST /message/sendText"| B
     B -->|resposta| A
 ```
 
 O fluxo de uma mensagem:
 
-1. **Twilio** recebe a mensagem no WhatsApp e faz um `POST` no endpoint `/webhook`, enviando `Body` (texto) e `From` (telefone) como form data.
-2. A **camada de interpretação** manda o texto pra API Claude com um system prompt que define as 16 intenções e força saída em JSON puro — sem markdown, sem explicação. A resposta é parseada em um dicionário Python.
+1. **Evolution API** recebe a mensagem no WhatsApp e faz um `POST` no endpoint `/webhook` com o payload JSON do evento `messages.upsert` (texto em `data.message.conversation` / `extendedTextMessage`, remetente em `data.key.remoteJid`).
+2. A **camada de interpretação** decide a intenção: pelas **regras locais** ou, se configurado, pela **API Claude** com um system prompt que define as 16 intenções e força saída em JSON puro.
 3. O **roteador de intenção** despacha pro handler correspondente, que executa a lógica de negócio e as operações no banco.
-4. O **banco** é acessado via API REST do Supabase (PostgREST), com filtros por telefone para isolar os dados de cada usuário.
-5. A resposta volta formatada em **TwiML**, que é o XML que a Twilio entrega de volta no WhatsApp.
+4. O **banco** PostgreSQL é acessado via `psycopg2` (pool de conexões), com filtros por telefone para isolar os dados de cada usuário.
+5. A resposta é enviada de volta pelo **Evolution API** via `POST /message/sendText/{instancia}`.
 
 O telefone do remetente funciona como chave de particionamento: toda consulta filtra por `telefone`, então múltiplos usuários compartilham as mesmas tabelas sem enxergar os dados uns dos outros.
 
 ## Stack
 
 | Camada | Tecnologia |
-|---|---|
+|--------|------------|
 | API | FastAPI + Uvicorn |
-| Interpretação de linguagem natural | API Claude (Anthropic) |
-| Banco de dados | PostgreSQL via Supabase |
-| Mensageria | Twilio WhatsApp API |
+| Interpretação | Regras locais (regex) + API Claude (Anthropic, opcional) |
+| Banco de dados | PostgreSQL 16 (Docker) |
+| Mensageria | Evolution API (WhatsApp) via Docker |
 | Cliente HTTP | httpx |
-| Hospedagem | Render |
+| Orquestração | Docker Compose |
+
+## Rodando localmente
+
+**Pré-requisitos:** Docker e Docker Compose.
+
+```bash
+git clone https://github.com/enzostana/tino-ai.git
+cd tino-ai
+
+cp .env.example .env
+# Preencha .env (por enquanto apenas EVOLUTION_INSTANCE e EVOLUTION_API_KEY
+# são necessários; ANTHROPIC_API_KEY é opcional e POSTGRES_PASSWORD pode ser trocada)
+```
+
+Subindo a stack (banco + Evolution API + app):
+
+```bash
+docker compose up -d --build
+```
+
+Verifique a saúde:
+
+```bash
+curl http://localhost:8000/          # Tino.IA rodando! 🐙
+curl http://localhost:8081/          # Evolution API v2
+```
+
+### Pareando o WhatsApp
+
+1. Acesse o gerenciador da Evolution API em `http://localhost:8081/manager`.
+2. Crie uma instância chamada **tino** (integração `WHATSAPP-BAILEYS`).
+3. Escaneie o QR Code com o WhatsApp do seu celular (*WhatsApp > Aparelhos conectados*).
+4. Configure o webhook da instância para o evento `MESSAGES_UPSERT` apontando para `http://app:8000/webhook` (o app e a Evolution API se comunicam pela rede interna do Docker).
+
+Alternativa via API:
+
+```bash
+# Criar instância
+curl -X POST http://localhost:8081/instance/create \
+  -H "apikey: SEU_TOKEN" -H "Content-Type: application/json" \
+  -d '{"instanceName":"tino","integration":"WHATSAPP-BAILEYS","qrcode":true}'
+
+# Configurar webhook
+curl -X POST http://localhost:8081/webhook/set/tino \
+  -H "apikey: SEU_TOKEN" -H "Content-Type: application/json" \
+  -d '{"webhook":{"enabled":true,"url":"http://app:8000/webhook","events":["MESSAGES_UPSERT"],"byEvents":true}}'
+```
+
+Pronto: mande "ajuda" para o seu próprio número e comece a registrar gastos.
+
+### Testando sem WhatsApp
+
+O endpoint `/webhook` aceita o mesmo payload que a Evolution API envia:
+
+```bash
+curl -X POST http://localhost:8000/webhook -H "Content-Type: application/json" -d '{
+  "event": "messages.upsert",
+  "instance": "tino",
+  "data": {
+    "key": {"remoteJid": "5511999999999@s.whatsapp.net", "fromMe": false},
+    "message": {"conversation": "uber 27"}
+  }
+}'
+```
+
+## Variáveis de ambiente
+
+| Variável | Obrigatória | Descrição |
+|----------|-------------|-----------|
+| `EVOLUTION_INSTANCE` | Sim | Nome da instância na Evolution API (ex: `tino`) |
+| `EVOLUTION_API_KEY` | Sim | Token de autenticação da Evolution API |
+| `POSTGRES_PASSWORD` | Sim | Senha do banco PostgreSQL |
+| `ANTHROPIC_API_KEY` | Não | Chave da API Claude. Sem ela, o bot usa apenas as regras locais |
 
 ## Modelo de dados
 
@@ -126,64 +191,19 @@ create table lembretes (
 );
 ```
 
-## Rodando localmente
-
-**Pré-requisitos:** Python 3.11+, uma conta no Supabase, uma chave da API Anthropic e uma conta Twilio com o sandbox do WhatsApp ativo.
-
-```bash
-git clone https://github.com/joaomauricioporto/paylo-ai.git
-cd paylo-ai
-
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-
-pip install -r requirements.txt
-```
-
-Crie um arquivo `.env` na raiz:
-
-```env
-ANTHROPIC_API_KEY=sua_chave_aqui
-SUPABASE_URL=https://seu-projeto.supabase.co
-SUPABASE_KEY=sua_service_key_aqui
-```
-
-Suba o servidor:
-
-```bash
-uvicorn main:app --reload
-```
-
-Pra receber mensagens em ambiente local, exponha a porta com [ngrok](https://ngrok.com) e aponte o webhook da Twilio pra URL gerada:
-
-```bash
-ngrok http 8000
-```
-
-No console da Twilio, em *WhatsApp Sandbox Settings*, configure **When a message comes in** para `https://sua-url.ngrok.io/webhook` com método `POST`.
-
-O endpoint `GET /` funciona como health check e retorna o status da aplicação.
-
 ## Deploy
 
-Hospedado na **Render** como Web Service:
-
-- **Build command:** `pip install -r requirements.txt`
-- **Start command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
-- **Variáveis de ambiente:** as mesmas três do `.env`
-
-Nenhuma credencial fica no código — todas são lidas via `os.getenv()`.
+A stack é 100% Docker e roda em qualquer VPS. Para expor o webhook publicamente, aponte um túnel (ex: `cloudflared` ou ngrok) para a porta `8000` do host e use essa URL no webhook da Evolution API.
 
 ## Roadmap
 
-- [ ] Migrar as chamadas HTTP para `httpx.AsyncClient`, evitando bloqueio do event loop
-- [ ] Armazenar `data` como `timestamptz` em vez de texto, simplificando os filtros por período
-- [ ] Testes automatizados para a camada de interpretação e para os handlers de intenção
-- [ ] Exportação do histórico em CSV
-- [ ] Gráficos mensais enviados como imagem
+- Migrar `data` para `timestamptz` em vez de texto
+- Testes automatizados para a camada de interpretação e handlers
+- Exportação do histórico em CSV
+- Gráficos mensais enviados como imagem
+- Suporte a áudio e foto de comprovante
+- Dashboard web
 
-## Autor
+## Agradecimentos
 
-**João Maurício Medeiros Porto** — estudante de Ciência da Computação na UEPB.
-
-[GitHub](https://github.com/joaomauricioporto) · [LinkedIn](https://linkedin.com/in/joaomauricioporto)
+Projeto derivado de [paylo-ai](https://github.com/joaomauricioporto/paylo-ai), de João Maurício Medeiros Porto. O Tino.IA substitui o Twilio/Supabase por Evolution API + PostgreSQL local e adiciona o modo de interpretação por regras.

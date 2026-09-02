@@ -1,0 +1,60 @@
+services:
+  db:
+    image: postgres:16
+    container_name: tino-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tino
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: tino
+    ports:
+      - "5432:5432"
+    volumes:
+      - tino-db-data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tino -d tino"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  evolution-api:
+    image: evoapicloud/evolution-api:latest
+    container_name: tino-evolution-api
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      - tino-evolution-instances:/evolution/instances
+    environment:
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      SERVER_URL: http://evolution-api:8080
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://tino:${POSTGRES_PASSWORD}@db:5432/evolution_db?schema=evolution_api
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      CACHE_REDIS_ENABLED: "false"
+      WEBHOOK_GLOBAL_ENABLED: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    build: .
+    container_name: tino-app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      EVOLUTION_URL: http://evolution-api:8080
+      EVOLUTION_INSTANCE: ${EVOLUTION_INSTANCE}
+      EVOLUTION_API_KEY: ${EVOLUTION_API_KEY}
+      DATABASE_URL: postgresql://tino:${POSTGRES_PASSWORD}@db:5432/tino
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  tino-db-data:
+  tino-evolution-instances:

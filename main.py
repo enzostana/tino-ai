@@ -1,11 +1,13 @@
-from fastapi import FastAPI, Form, BackgroundTasks
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 import anthropic
 import json
 import os
+import re
 from datetime import datetime, timedelta
 import httpx
 import logging
+from psycopg2 import pool
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -13,35 +15,58 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+EVOLUTION_URL = os.getenv("EVOLUTION_URL", "").rstrip("/")
+EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "")
+EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-SUPABASE_API = f"{SUPABASE_URL}/rest/v1"
 
-HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=representation"
-}
+_db_pool = None
+
+def get_pool():
+    global _db_pool
+    if _db_pool is None:
+        _db_pool = pool.ThreadedConnectionPool(1, 10, dsn=DATABASE_URL)
+    return _db_pool
+
+def query(sql, params=None):
+    """Executa uma query e retorna linhas como dicionários (ou [] para DML sem retorno)."""
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            if cur.description:
+                cols = [d[0] for d in cur.description]
+                rows = cur.fetchall()
+                conn.commit()
+                return [dict(zip(cols, r)) for r in rows]
+            conn.commit()
+            return []
+    finally:
+        pool.putconn(conn)
+
+def insert(sql, params):
+    """Executa um INSERT e retorna o id gerado."""
+    resultado = query(sql, params)
+    return resultado[0]["id"] if resultado else "?"
+
+# ============================================================
+# WHATSAPP (EVOLUTION API)
+# ============================================================
+def enviar_whatsapp(telefone, texto):
+    try:
+        url = f"{EVOLUTION_URL}/message/sendText/{EVOLUTION_INSTANCE}"
+        headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
+        data = {"number": telefone, "text": texto}
+        httpx.post(url, headers=headers, json=data, timeout=20)
+    except Exception as e:
+        logger.error(f"Falha ao enviar WhatsApp para {telefone}: {e}")
 
 # ============================================================
 # HELPERS
 # ============================================================
-def get(url, params=None):
-    r = httpx.get(url, headers=HEADERS, params=params)
-    r.raise_for_status()
-    return r.json()
-
-def post(url, data):
-    r = httpx.post(url, headers=HEADERS, json=data)
-    r.raise_for_status()
-    return r.json()
-
-def delete(url, params):
-    httpx.delete(url, headers=HEADERS, params=params)
-
 def filtro_mes(hoje, offset=0):
     """Retorna o prefixo YYYY-MM para o mês atual ou anterior."""
     mes = hoje.month - offset
@@ -53,57 +78,57 @@ def filtro_mes(hoje, offset=0):
 
 def buscar_gastos_periodo(telefone, periodo="mes"):
     hoje = datetime.now()
-    url = f"{SUPABASE_API}/gastos"
     if periodo == "hoje":
-        params = {"telefone": f"eq.{telefone}", "data": f"like.{hoje.strftime('%Y-%m-%d')}%25", "order": "id.desc"}
+        return query(
+            "SELECT * FROM gastos WHERE telefone = %s AND data LIKE %s ORDER BY id DESC",
+            (telefone, f"{hoje.strftime('%Y-%m-%d')}%")
+        )
     elif periodo == "semana":
         inicio = (hoje - timedelta(days=7)).strftime("%Y-%m-%d")
-        params = {"telefone": f"eq.{telefone}", "data": f"gte.{inicio}", "order": "id.desc"}
-    else:
-        params = {"telefone": f"eq.{telefone}", "data": f"like.{filtro_mes(hoje)}%25", "order": "id.desc"}
-    return get(url, params)
+        return query(
+            "SELECT * FROM gastos WHERE telefone = %s AND data >= %s ORDER BY id DESC",
+            (telefone, inicio)
+        )
+    return query(
+        "SELECT * FROM gastos WHERE telefone = %s AND data LIKE %s ORDER BY id DESC",
+        (telefone, f"{filtro_mes(hoje)}%")
+    )
 
 def buscar_gastos_mes_offset(telefone, offset=0):
     """Busca gastos de um mês específico. offset=0 = mês atual, offset=1 = mês passado."""
-    hoje = datetime.now()
-    prefixo = filtro_mes(hoje, offset)
-    url = f"{SUPABASE_API}/gastos"
-    params = {"telefone": f"eq.{telefone}", "data": f"like.{prefixo}%25", "order": "id.desc"}
-    return get(url, params)
+    prefixo = filtro_mes(datetime.now(), offset)
+    return query(
+        "SELECT * FROM gastos WHERE telefone = %s AND data LIKE %s ORDER BY id DESC",
+        (telefone, f"{prefixo}%")
+    )
 
 # ============================================================
 # GASTOS
 # ============================================================
 def salvar_gasto(descricao, valor, categoria, forma_pagamento, telefone):
-    data = {
-        "data": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "descricao": descricao, "valor": valor,
-        "categoria": categoria, "forma_pagamento": forma_pagamento,
-        "telefone": telefone
-    }
-    resultado = post(f"{SUPABASE_API}/gastos", data)
-    return resultado[0]["id"] if resultado else "?"
+    return insert(
+        "INSERT INTO gastos (telefone, data, descricao, valor, categoria, forma_pagamento) "
+        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+        (telefone, datetime.now().strftime("%Y-%m-%d %H:%M"), descricao, valor, categoria, forma_pagamento)
+    )
 
 def remover_ultimo_gasto(telefone):
-    url = f"{SUPABASE_API}/gastos"
-    gastos = get(url, {"telefone": f"eq.{telefone}", "order": "id.desc", "limit": "1"})
+    gastos = query("SELECT * FROM gastos WHERE telefone = %s ORDER BY id DESC LIMIT 1", (telefone,))
     if not gastos: return None
     gasto = gastos[0]
-    delete(url, {"id": f"eq.{gasto['id']}"})
+    query("DELETE FROM gastos WHERE id = %s", (gasto["id"],))
     return gasto
 
 def remover_gasto_por_descricao(telefone, descricao):
-    url = f"{SUPABASE_API}/gastos"
-    gastos = get(url, {"telefone": f"eq.{telefone}", "order": "id.desc", "limit": "50"})
+    gastos = query("SELECT * FROM gastos WHERE telefone = %s ORDER BY id DESC LIMIT 50", (telefone,))
     filtrados = [g for g in gastos if descricao.lower() in g.get("descricao", "").lower()]
     if not filtrados: return None
     gasto = filtrados[0]
-    delete(url, {"id": f"eq.{gasto['id']}"})
+    query("DELETE FROM gastos WHERE id = %s", (gasto["id"],))
     return gasto
 
 def remover_gasto_por_categoria(telefone, categoria, valor=None):
-    url = f"{SUPABASE_API}/gastos"
-    gastos = get(url, {"telefone": f"eq.{telefone}", "order": "id.desc", "limit": "50"})
+    gastos = query("SELECT * FROM gastos WHERE telefone = %s ORDER BY id DESC LIMIT 50", (telefone,))
     filtrados = [g for g in gastos if categoria.lower() in g.get("categoria", "").lower()]
     if not filtrados: return None
     if valor:
@@ -112,79 +137,89 @@ def remover_gasto_por_categoria(telefone, categoria, valor=None):
         gasto = por_valor[0]
     else:
         gasto = filtrados[0]
-    delete(url, {"id": f"eq.{gasto['id']}"})
+    query("DELETE FROM gastos WHERE id = %s", (gasto["id"],))
     return gasto
 
 def listar_ultimos_gastos(telefone, limite=5):
-    return get(f"{SUPABASE_API}/gastos", {"telefone": f"eq.{telefone}", "order": "id.desc", "limit": str(limite)})
+    return query(
+        "SELECT * FROM gastos WHERE telefone = %s ORDER BY id DESC LIMIT %s",
+        (telefone, limite)
+    )
 
 # ============================================================
 # RECEITAS
 # ============================================================
 def salvar_receita(descricao, valor, categoria, telefone):
-    data = {
-        "data": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "descricao": descricao, "valor": valor,
-        "categoria": categoria, "telefone": telefone
-    }
-    resultado = post(f"{SUPABASE_API}/receitas", data)
-    return resultado[0]["id"] if resultado else "?"
+    return insert(
+        "INSERT INTO receitas (telefone, data, descricao, valor, categoria) "
+        "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+        (telefone, datetime.now().strftime("%Y-%m-%d %H:%M"), descricao, valor, categoria)
+    )
 
 def buscar_receitas_periodo(telefone, periodo="mes"):
     hoje = datetime.now()
-    url = f"{SUPABASE_API}/receitas"
     if periodo == "hoje":
-        params = {"telefone": f"eq.{telefone}", "data": f"like.{hoje.strftime('%Y-%m-%d')}%25", "order": "id.desc"}
+        return query(
+            "SELECT * FROM receitas WHERE telefone = %s AND data LIKE %s ORDER BY id DESC",
+            (telefone, f"{hoje.strftime('%Y-%m-%d')}%")
+        )
     elif periodo == "semana":
         inicio = (hoje - timedelta(days=7)).strftime("%Y-%m-%d")
-        params = {"telefone": f"eq.{telefone}", "data": f"gte.{inicio}", "order": "id.desc"}
-    else:
-        params = {"telefone": f"eq.{telefone}", "data": f"like.{filtro_mes(datetime.now())}%25", "order": "id.desc"}
-    return get(url, params)
+        return query(
+            "SELECT * FROM receitas WHERE telefone = %s AND data >= %s ORDER BY id DESC",
+            (telefone, inicio)
+        )
+    return query(
+        "SELECT * FROM receitas WHERE telefone = %s AND data LIKE %s ORDER BY id DESC",
+        (telefone, f"{filtro_mes(hoje)}%")
+    )
 
 # ============================================================
 # METAS
 # ============================================================
 def salvar_meta(telefone, categoria, limite):
-    url = f"{SUPABASE_API}/metas"
-    # Verifica se já existe meta para essa categoria
-    existentes = get(url, {"telefone": f"eq.{telefone}", "order": "id.desc", "limit": "50"})
+    existentes = query("SELECT * FROM metas WHERE telefone = %s ORDER BY id DESC LIMIT 50", (telefone,))
     for m in existentes:
         if categoria.lower() in m.get("categoria", "").lower():
-            # Atualiza
-            httpx.patch(url, headers=HEADERS, params={"id": f"eq.{m['id']}"}, json={"limite": limite})
+            query("UPDATE metas SET limite = %s WHERE id = %s", (limite, m["id"]))
             return "atualizada"
-    data = {"telefone": telefone, "categoria": categoria, "limite": limite}
-    post(url, data)
+    query(
+        "INSERT INTO metas (telefone, categoria, limite) VALUES (%s, %s, %s)",
+        (telefone, categoria, limite)
+    )
     return "criada"
 
 def buscar_metas(telefone):
-    return get(f"{SUPABASE_API}/metas", {"telefone": f"eq.{telefone}", "order": "categoria.asc"})
+    return query("SELECT * FROM metas WHERE telefone = %s ORDER BY categoria ASC", (telefone,))
 
 # ============================================================
 # LEMBRETES
 # ============================================================
 def salvar_lembrete(telefone, descricao, valor, dia_vencimento):
-    data = {"telefone": telefone, "descricao": descricao, "valor": valor, "dia_vencimento": dia_vencimento}
-    resultado = post(f"{SUPABASE_API}/lembretes", data)
-    return resultado[0]["id"] if resultado else "?"
+    return insert(
+        "INSERT INTO lembretes (telefone, descricao, valor, dia_vencimento) "
+        "VALUES (%s, %s, %s, %s) RETURNING id",
+        (telefone, descricao, valor, dia_vencimento)
+    )
 
 def buscar_lembretes(telefone):
-    return get(f"{SUPABASE_API}/lembretes", {"telefone": f"eq.{telefone}", "order": "dia_vencimento.asc"})
+    return query(
+        "SELECT * FROM lembretes WHERE telefone = %s ORDER BY dia_vencimento ASC",
+        (telefone,)
+    )
 
 def remover_lembrete(telefone, descricao):
-    url = f"{SUPABASE_API}/lembretes"
-    lembretes = get(url, {"telefone": f"eq.{telefone}", "order": "id.desc", "limit": "50"})
+    lembretes = query("SELECT * FROM lembretes WHERE telefone = %s ORDER BY id DESC LIMIT 50", (telefone,))
     filtrados = [l for l in lembretes if descricao.lower() in l.get("descricao", "").lower()]
     if not filtrados: return None
     lembrete = filtrados[0]
-    delete(url, {"id": f"eq.{lembrete['id']}"})
+    query("DELETE FROM lembretes WHERE id = %s", (lembrete["id"],))
     return lembrete
 
 # ============================================================
 # IA
 # ============================================================
-SYSTEM_PROMPT = """Você é um assistente financeiro pessoal via WhatsApp chamado Paylo.IA 🐒.
+SYSTEM_PROMPT = """Você é um assistente financeiro pessoal via WhatsApp chamado Tino.IA 🐙.
 Responda APENAS com JSON válido, sem markdown, sem explicações.
 
 1. REGISTRAR GASTO (ex: "uber 27", "mercado 150 débito", "almoço 35 pix"):
@@ -238,7 +273,7 @@ Períodos: hoje, semana, mes
 16. OUTROS (ex: "oi", "ajuda"):
 {"tipo": "ajuda"}"""
 
-def interpretar_mensagem(mensagem):
+def interpretar_com_claude(mensagem):
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=400,
@@ -251,6 +286,206 @@ def interpretar_mensagem(mensagem):
         if texto.startswith("json"):
             texto = texto[4:]
     return json.loads(texto.strip())
+
+# ============================================================
+# IA — REGRAS (sem chave de API)
+# ============================================================
+NOMES_CATEGORIAS = [
+    "alimentação", "alimentacao", "transporte", "lazer", "saúde", "saude",
+    "moradia", "educação", "educacao", "vestuário", "vestuario", "outros"
+]
+
+PALAVRAS_CATEGORIA = {
+    "Alimentação": ["alimentação", "alimentacao", "almoço", "almoco", "jantar", "mercado",
+                    "ifood", "i food", "lanche", "café", "cafe", "restaurante", "açaí",
+                    "acai", "padaria", "supermercado", "comida", "pizza", "hamburguer",
+                    "hambúrguer", "feira", "sushi", "dogao", "dogão", "pão", "pao",
+                    "x-burger", "esfiha", "marmita"],
+    "Transporte": ["transporte", "uber", "99", "taxi", "táxi", "gasolina", "combustivel",
+                   "combustível", "ônibus", "onibus", "metrô", "metro", "pedágio",
+                   "pedagio", "estacionamento", "bilhete", "passagem", "carro",
+                   "app de carro", "voo", "passe"],
+    "Lazer": ["lazer", "cinema", "jogo", "stream", "netflix", "spotify", "show", "bar",
+              "festa", "viagem", "passeio", "steam", "game", "balada", "cerveja",
+              "happy hour"],
+    "Saúde": ["saúde", "saude", "farmacia", "farmácia", "remédio", "remedio", "médico",
+              "medico", "dentista", "academia", "psicólogo", "psicologo", "consulta",
+              "exame", "vacina", "fisioterapia"],
+    "Moradia": ["moradia", "aluguel", "condominio", "condomínio", "luz", "energia", "água",
+                "agua", "internet", "gás", "gas", "iptu", "conta de luz", "conta de água",
+                "limpeza"],
+    "Educação": ["educação", "educacao", "curso", "faculdade", "mensalidade", "livro",
+                 "escola", "universidade", "material escolar", "matrícula", "matricula",
+                 "aula"],
+    "Vestuário": ["vestuário", "vestuario", "roupa", "camisa", "sapato", "tênis", "tenis",
+                  "calça", "calca", "vestido", "casaco", "blusa", "short"],
+}
+
+FORMAS_PAGAMENTO = ["pix", "débito", "debito", "crédito", "credito", "cartão", "cartao",
+                    "dinheiro", "boleto", "transferência", "transferencia"]
+
+PALAVRAS_RECEITA = ["recebi", "recebido", "salário", "salario", "freelance", "freela",
+                    "investimento", "dividendo", "presente", "entrada", "renda", "comissão",
+                    "comissao", "bônus", "bonus", "ganhei", "pix recebido", "vendi", "venda"]
+
+CATEGORIA_RECEITA = {
+    "Salário": ["salário", "salario", "salario", "renda"],
+    "Freelance": ["freelance", "freela", "comissão", "comissao", "vendi", "venda"],
+    "Investimento": ["investimento", "dividendo", "rendimento"],
+    "Presente": ["presente", "ganhei", "bônus", "bonus"],
+}
+
+VALOR_RE = re.compile(r"(?:R\$|r\$)?\s*(\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)")
+
+DIA_RE = re.compile(r"(?:dia|vence(?: dia)?|todo dia|todo mês|todo mes)\s*(\d{1,2})")
+
+def extrair_valor(texto):
+    m = VALOR_RE.search(texto)
+    if not m:
+        return None
+    return float(m.group(1).replace(".", "").replace(",", "."))
+
+def limpar_descricao(texto):
+    desc = texto.lower()
+    for w in ["gastei", "paguei", "comprei", "foi", "no", "na", "nos", "nas", "de", "do",
+              "da", "em", "com", "um", "uma", "hoje", "ontem", "agora", "registrar",
+              "registra", "recebi", "recebido", "ganhei", "entrada de"]:
+        desc = re.sub(rf"\b{w}\b", " ", desc)
+    for f in FORMAS_PAGAMENTO:
+        desc = desc.replace(f, " ")
+    desc = re.sub(r"\b\d+[.,]?\d*\b", " ", desc)
+    desc = re.sub(r"\s+", " ", desc).strip()
+    return desc.capitalize() or "Gasto"
+
+def detectar_categoria(texto):
+    for cat, palavras in PALAVRAS_CATEGORIA.items():
+        for p in palavras:
+            if re.search(rf"\b{re.escape(p)}\b", texto.lower()):
+                return cat
+    return None
+
+def detectar_forma(texto):
+    for f in FORMAS_PAGAMENTO:
+        if re.search(rf"\b{re.escape(f)}\b", texto.lower()):
+            return f
+    return "não informado"
+
+def detectar_categoria_receita(texto):
+    for cat, palavras in CATEGORIA_RECEITA.items():
+        for p in palavras:
+            if re.search(rf"\b{re.escape(p)}\b", texto.lower()):
+                return cat
+    return "Outros"
+
+def nome_categoria_no_texto(texto):
+    for nome in NOMES_CATEGORIAS:
+        if re.search(rf"\b{re.escape(nome)}\b", texto.lower()):
+            return nome
+    return None
+
+def interpretar_com_regras(mensagem):
+    m = mensagem.lower().strip()
+
+    if m in ("oi", "ola", "olá", "ajuda", "help", "hello", "começar", "comecar", "inicio", "início"):
+        return {"tipo": "ajuda"}
+
+    if any(p in m for p in ["quanto gastei no", "total no", "gastei no cartão", "gastei no cartao",
+                            "no cartão", "no cartao", "total no pix", "quanto no pix",
+                            "gastos no cartão", "gastos no cartao", "no débito", "no debito",
+                            "no crédito", "no credito"]):
+        forma = detectar_forma(m)
+        if forma == "não informado":
+            forma = "cartão" if ("cart" in m) else "pix" if "pix" in m else "cartão"
+        periodo = "hoje" if "hoje" in m else "semana" if ("semana" in m or "7 dias" in m) else "mes"
+        return {"tipo": "relatorio_pagamento", "forma": forma, "periodo": periodo}
+
+    if any(p in m for p in ["resumo", "quanto gastei", "gastei quanto", "relatório", "relatorio",
+                            "meus gastos", "gastos do mês", "gastos do mes"]):
+        periodo = "hoje" if "hoje" in m else "semana" if ("semana" in m or "7 dias" in m) else "mes"
+        return {"tipo": "relatorio", "periodo": periodo}
+
+    if "saldo" in m or "quanto tenho" in m or "quanto sobrou" in m or "quanto sobra" in m:
+        periodo = "hoje" if "hoje" in m else "semana" if ("semana" in m or "7 dias" in m) else "mes"
+        return {"tipo": "saldo", "periodo": periodo}
+
+    if "compar" in m or "mês passado" in m or "mes passado" in m or "vs mês" in m:
+        return {"tipo": "comparativo"}
+
+    if "histórico" in m or "historico" in m or "últimos gastos" in m or "ultimos gastos" in m \
+            or "o que registrei" in m or "ultimas compras" in m or "últimas compras" in m:
+        return {"tipo": "historico"}
+
+    if "remover último" in m or "remover ultimo" in m or "desfazer" in m or "apagar último" in m \
+            or "apagar ultimo" in m or "desfaz" in m:
+        return {"tipo": "remover_ultimo"}
+
+    if m.startswith("remover ") or m.startswith("apagar ") or m.startswith("excluir ") \
+            or m.startswith("deletar ") or m.startswith("extorn") or m.startswith("estorno"):
+        resto = m.split(" ", 1)[1].strip() if " " in m else ""
+        if "lembrete" in resto or "conta" in resto:
+            desc = resto.replace("lembrete", "").replace("conta", "").strip()
+            return {"tipo": "remover_lembrete", "descricao": desc}
+        nome_cat = nome_categoria_no_texto(resto)
+        if nome_cat:
+            valor = extrair_valor(resto)
+            return {"tipo": "remover_categoria", "categoria": nome_cat.capitalize(), "valor": valor}
+        if "meta" in resto:
+            return {"tipo": "remover_lembrete", "descricao": resto.replace("meta", "").strip()}
+        return {"tipo": "remover_item", "descricao": resto}
+
+    if any(p in m for p in ["minhas metas", "ver metas", "ver limites", "meus limites"]):
+        return {"tipo": "ver_metas"}
+
+    if "meta" in m or "limite" in m or "limitar" in m:
+        valor = extrair_valor(m)
+        if valor:
+            cat = detectar_categoria(m) or "Outros"
+            return {"tipo": "definir_meta", "categoria": cat, "limite": valor}
+        return {"tipo": "ver_metas"}
+
+    if any(p in m for p in ["meus lembretes", "ver lembretes", "contas fixas", "minhas contas",
+                            "meus compromissos"]):
+        return {"tipo": "ver_lembretes"}
+
+    dia_match = DIA_RE.search(m)
+    if dia_match and ("lembrete" in m or "vence" in m or "todo dia" in m or "conta" in m
+                      or "compromisso" in m):
+        dia = int(dia_match.group(1))
+        valor = extrair_valor(m) or 0.0
+        desc = m.replace("lembrete", "").replace("conta", "").replace("compromisso", "")
+        desc = re.sub(r"(?:vence(?: dia)?|todo dia|todo mês|todo mes|dia)\s*\d{1,2}.*$", "", desc)
+        desc = re.sub(r"\d+[.,]?\d*", "", desc).strip()
+        for w in ["de", "do", "da", "no", "na", "em", "todo"]:
+            desc = re.sub(rf"\b{w}\b", " ", desc)
+        desc = re.sub(r"\s+", " ", desc).strip().capitalize()
+        return {"tipo": "adicionar_lembrete", "descricao": desc or "Conta", "valor": valor,
+                "dia_vencimento": dia}
+
+    if any(p in m for p in PALAVRAS_RECEITA):
+        valor = extrair_valor(m)
+        if valor:
+            cat = detectar_categoria_receita(m)
+            desc = limpar_descricao(m)
+            return {"tipo": "receita", "descricao": desc, "valor": valor, "categoria": cat}
+
+    valor = extrair_valor(m)
+    if valor:
+        desc = limpar_descricao(m)
+        cat = detectar_categoria(m) or "Outros"
+        forma = detectar_forma(m)
+        return {"tipo": "gasto", "descricao": desc, "valor": valor, "categoria": cat,
+                "forma_pagamento": forma}
+
+    return {"tipo": "ajuda"}
+
+def interpretar_mensagem(mensagem):
+    """Usa Claude se ANTHROPIC_API_KEY estiver configurada; senão, usa regras locais."""
+    if ANTHROPIC_API_KEY:
+        try:
+            return interpretar_com_claude(mensagem)
+        except Exception as e:
+            logger.warning(f"Claude falhou, usando regras: {e}")
+    return interpretar_com_regras(mensagem)
 
 # ============================================================
 # RELATÓRIOS
@@ -270,7 +505,6 @@ def gerar_relatorio(telefone, periodo):
         linhas.append(f"  {cat}: R$ {val:.2f}")
     linhas.append(f"\n💰 *Total: R$ {total:.2f}*")
 
-    # Verifica metas
     metas = buscar_metas(telefone)
     alertas = []
     for meta in metas:
@@ -332,7 +566,6 @@ def gerar_comparativo(telefone):
     mes_atual = hoje.strftime("%B/%Y")
     mes_passado = (hoje.replace(day=1) - timedelta(days=1)).strftime("%B/%Y")
 
-    # Categorias dos dois meses
     cats_atual = {}
     for g in gastos_atual:
         cats_atual[g["categoria"]] = cats_atual.get(g["categoria"], 0) + g["valor"]
@@ -420,7 +653,7 @@ def gerar_historico(telefone):
 # ============================================================
 # AJUDA
 # ============================================================
-MENSAGEM_AJUDA = """🐒 *Paylo.IA — Seu assistente financeiro!*
+MENSAGEM_AJUDA = """🐙 *Tino.IA — Seu assistente financeiro!*
 
 *📝 Gastos:*
 • "mercado 150" / "uber 27 pix"
@@ -450,115 +683,146 @@ MENSAGEM_AJUDA = """🐒 *Paylo.IA — Seu assistente financeiro!*
 *💡 Escreva naturalmente, eu entendo! 😊*"""
 
 # ============================================================
+# PROCESSAMENTO
+# ============================================================
+def processar_mensagem(mensagem, telefone):
+    """Interpreta a mensagem com IA e executa a intenção. Retorna o texto de resposta."""
+    resultado = interpretar_mensagem(mensagem)
+    logger.info(f"Interpretado: {resultado}")
+    tipo = resultado["tipo"]
+
+    if tipo == "gasto":
+        gasto_id = salvar_gasto(
+            resultado["descricao"], resultado["valor"],
+            resultado["categoria"], resultado.get("forma_pagamento", "não informado"), telefone
+        )
+        metas = buscar_metas(telefone)
+        gastos_mes = buscar_gastos_mes_offset(telefone, 0)
+        por_cat = {}
+        for g in gastos_mes:
+            por_cat[g["categoria"]] = por_cat.get(g["categoria"], 0) + g["valor"]
+        alerta = ""
+        for meta in metas:
+            if meta["categoria"].lower() == resultado["categoria"].lower():
+                gasto_cat = por_cat.get(resultado["categoria"], 0)
+                pct = (gasto_cat / meta["limite"]) * 100
+                if pct >= 100:
+                    alerta = f"\n\n🚨 *Atenção!* Você ultrapassou o limite de R$ {meta['limite']:.2f} em {resultado['categoria']}!"
+                elif pct >= 80:
+                    alerta = f"\n\n⚠️ Você usou {pct:.0f}% do limite de {resultado['categoria']} (R$ {gasto_cat:.2f}/R$ {meta['limite']:.2f})"
+        return (
+            f"✅ *Gasto registrado!* (#{gasto_id})\n\n"
+            f"📌 {resultado['descricao'].capitalize()}\n"
+            f"💵 R$ {resultado['valor']:.2f}\n"
+            f"🏷️ {resultado['categoria']}\n"
+            f"💳 {resultado.get('forma_pagamento', 'não informado').capitalize()}"
+            + alerta
+        )
+
+    if tipo == "receita":
+        rec_id = salvar_receita(resultado["descricao"], resultado["valor"], resultado.get("categoria", "Outros"), telefone)
+        return (
+            f"✅ *Receita registrada!* (#{rec_id})\n\n"
+            f"📌 {resultado['descricao'].capitalize()}\n"
+            f"💵 R$ {resultado['valor']:.2f}\n"
+            f"🏷️ {resultado.get('categoria', 'Outros')}"
+        )
+
+    if tipo == "relatorio":
+        return gerar_relatorio(telefone, resultado.get("periodo", "mes"))
+
+    if tipo == "relatorio_pagamento":
+        return gerar_relatorio_pagamento(telefone, resultado.get("forma", "cartão"), resultado.get("periodo", "mes"))
+
+    if tipo == "saldo":
+        return gerar_saldo(telefone, resultado.get("periodo", "mes"))
+
+    if tipo == "comparativo":
+        return gerar_comparativo(telefone)
+
+    if tipo == "definir_meta":
+        status = salvar_meta(telefone, resultado["categoria"], resultado["limite"])
+        return f"🎯 *Meta {status}!*\n\n{resultado['categoria']}: R$ {resultado['limite']:.2f}/mês"
+
+    if tipo == "ver_metas":
+        return gerar_ver_metas(telefone)
+
+    if tipo == "adicionar_lembrete":
+        lembrete_id = salvar_lembrete(telefone, resultado["descricao"], resultado["valor"], resultado["dia_vencimento"])
+        return f"🔔 *Lembrete adicionado!* (#{lembrete_id})\n\n📌 {resultado['descricao'].capitalize()}\n💵 R$ {resultado['valor']:.2f}\n📅 Todo dia {resultado['dia_vencimento']}"
+
+    if tipo == "ver_lembretes":
+        return gerar_ver_lembretes(telefone)
+
+    if tipo == "remover_lembrete":
+        lembrete = remover_lembrete(telefone, resultado.get("descricao", ""))
+        return f"🗑️ *Lembrete removido!*\n\n📌 {lembrete['descricao'].capitalize()}" if lembrete else "❌ Lembrete não encontrado."
+
+    if tipo == "remover_ultimo":
+        gasto = remover_ultimo_gasto(telefone)
+        return f"🗑️ *Gasto removido!*\n\n📌 {gasto['descricao'].capitalize()} — R$ {gasto['valor']:.2f}" if gasto else "📭 Nenhum gasto para remover."
+
+    if tipo == "remover_item":
+        gasto = remover_gasto_por_descricao(telefone, resultado.get("descricao", ""))
+        return f"🗑️ *Gasto removido!*\n\n📌 {gasto['descricao'].capitalize()} — R$ {gasto['valor']:.2f}" if gasto else "❌ Gasto não encontrado."
+
+    if tipo == "remover_categoria":
+        gasto = remover_gasto_por_categoria(telefone, resultado.get("categoria", ""), resultado.get("valor"))
+        return f"🗑️ *Gasto removido!*\n\n📌 {gasto['descricao'].capitalize()} — R$ {gasto['valor']:.2f} ({gasto['categoria']})" if gasto else f"❌ Nenhum gasto em {resultado.get('categoria', '')}."
+
+    if tipo == "historico":
+        return gerar_historico(telefone)
+
+    return MENSAGEM_AJUDA
+
+def extrair_texto(message):
+    """Extrai o texto de uma mensagem da Evolution API (ou None se não for texto)."""
+    if not message:
+        return None
+    if "conversation" in message:
+        return message["conversation"]
+    if "extendedTextMessage" in message:
+        return message["extendedTextMessage"].get("text")
+    return None
+
+# ============================================================
 # WEBHOOK
 # ============================================================
-@app.post("/webhook", response_class=PlainTextResponse)
-async def webhook(Body: str = Form(...), From: str = Form(...)):
-    mensagem = Body.strip()
-    telefone = From
+@app.post("/webhook")
+async def webhook(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"status": "payload inválido"}, status_code=400)
+
+    if payload.get("event") != "messages.upsert":
+        return {"status": "ignored"}
+
+    data = payload.get("data", {})
+    key = data.get("key", {})
+    if key.get("fromMe"):
+        return {"status": "ignored"}
+
+    telefone = key.get("remoteJid", "").split("@")[0]
+    if not telefone:
+        return {"status": "ignored"}
+
+    mensagem = extrair_texto(data.get("message", {}))
+    if not mensagem:
+        return {"status": "ignored"}
+    mensagem = mensagem.strip()
+
     logger.info(f"Mensagem de {telefone}: {mensagem}")
 
     try:
-        resultado = interpretar_mensagem(mensagem)
-        logger.info(f"Interpretado: {resultado}")
-        tipo = resultado["tipo"]
-
-        if tipo == "gasto":
-            gasto_id = salvar_gasto(
-                resultado["descricao"], resultado["valor"],
-                resultado["categoria"], resultado.get("forma_pagamento", "não informado"), telefone
-            )
-            # Verifica meta da categoria
-            metas = buscar_metas(telefone)
-            gastos_mes = buscar_gastos_mes_offset(telefone, 0)
-            por_cat = {}
-            for g in gastos_mes:
-                por_cat[g["categoria"]] = por_cat.get(g["categoria"], 0) + g["valor"]
-            alerta = ""
-            for meta in metas:
-                if meta["categoria"].lower() == resultado["categoria"].lower():
-                    gasto_cat = por_cat.get(resultado["categoria"], 0)
-                    pct = (gasto_cat / meta["limite"]) * 100
-                    if pct >= 100:
-                        alerta = f"\n\n🚨 *Atenção!* Você ultrapassou o limite de R$ {meta['limite']:.2f} em {resultado['categoria']}!"
-                    elif pct >= 80:
-                        alerta = f"\n\n⚠️ Você usou {pct:.0f}% do limite de {resultado['categoria']} (R$ {gasto_cat:.2f}/R$ {meta['limite']:.2f})"
-            resposta = (
-                f"✅ *Gasto registrado!* (#{gasto_id})\n\n"
-                f"📌 {resultado['descricao'].capitalize()}\n"
-                f"💵 R$ {resultado['valor']:.2f}\n"
-                f"🏷️ {resultado['categoria']}\n"
-                f"💳 {resultado.get('forma_pagamento', 'não informado').capitalize()}"
-                + alerta
-            )
-
-        elif tipo == "receita":
-            rec_id = salvar_receita(resultado["descricao"], resultado["valor"], resultado.get("categoria", "Outros"), telefone)
-            resposta = (
-                f"✅ *Receita registrada!* (#{rec_id})\n\n"
-                f"📌 {resultado['descricao'].capitalize()}\n"
-                f"💵 R$ {resultado['valor']:.2f}\n"
-                f"🏷️ {resultado.get('categoria', 'Outros')}"
-            )
-
-        elif tipo == "relatorio":
-            resposta = gerar_relatorio(telefone, resultado.get("periodo", "mes"))
-
-        elif tipo == "relatorio_pagamento":
-            resposta = gerar_relatorio_pagamento(telefone, resultado.get("forma", "cartão"), resultado.get("periodo", "mes"))
-
-        elif tipo == "saldo":
-            resposta = gerar_saldo(telefone, resultado.get("periodo", "mes"))
-
-        elif tipo == "comparativo":
-            resposta = gerar_comparativo(telefone)
-
-        elif tipo == "definir_meta":
-            status = salvar_meta(telefone, resultado["categoria"], resultado["limite"])
-            resposta = f"🎯 *Meta {status}!*\n\n{resultado['categoria']}: R$ {resultado['limite']:.2f}/mês"
-
-        elif tipo == "ver_metas":
-            resposta = gerar_ver_metas(telefone)
-
-        elif tipo == "adicionar_lembrete":
-            lembrete_id = salvar_lembrete(telefone, resultado["descricao"], resultado["valor"], resultado["dia_vencimento"])
-            resposta = f"🔔 *Lembrete adicionado!* (#{lembrete_id})\n\n📌 {resultado['descricao'].capitalize()}\n💵 R$ {resultado['valor']:.2f}\n📅 Todo dia {resultado['dia_vencimento']}"
-
-        elif tipo == "ver_lembretes":
-            resposta = gerar_ver_lembretes(telefone)
-
-        elif tipo == "remover_lembrete":
-            lembrete = remover_lembrete(telefone, resultado.get("descricao", ""))
-            resposta = f"🗑️ *Lembrete removido!*\n\n📌 {lembrete['descricao'].capitalize()}" if lembrete else "❌ Lembrete não encontrado."
-
-        elif tipo == "remover_ultimo":
-            gasto = remover_ultimo_gasto(telefone)
-            resposta = f"🗑️ *Gasto removido!*\n\n📌 {gasto['descricao'].capitalize()} — R$ {gasto['valor']:.2f}" if gasto else "📭 Nenhum gasto para remover."
-
-        elif tipo == "remover_item":
-            gasto = remover_gasto_por_descricao(telefone, resultado.get("descricao", ""))
-            resposta = f"🗑️ *Gasto removido!*\n\n📌 {gasto['descricao'].capitalize()} — R$ {gasto['valor']:.2f}" if gasto else "❌ Gasto não encontrado."
-
-        elif tipo == "remover_categoria":
-            gasto = remover_gasto_por_categoria(telefone, resultado.get("categoria", ""), resultado.get("valor"))
-            resposta = f"🗑️ *Gasto removido!*\n\n📌 {gasto['descricao'].capitalize()} — R$ {gasto['valor']:.2f} ({gasto['categoria']})" if gasto else f"❌ Nenhum gasto em {resultado.get('categoria', '')}."
-
-        elif tipo == "historico":
-            resposta = gerar_historico(telefone)
-
-        else:
-            resposta = MENSAGEM_AJUDA
-
+        resposta = processar_mensagem(mensagem, telefone)
     except Exception as e:
         logger.error(f"Erro: {e}")
         resposta = "⚠️ Não entendi sua mensagem.\n\nMande 'ajuda' para ver os comandos disponíveis."
 
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Message>{resposta}</Message>
-</Response>"""
-    return PlainTextResponse(content=twiml, media_type="application/xml")
+    enviar_whatsapp(telefone, resposta)
+    return {"status": "ok"}
 
 @app.get("/")
 def health():
-    return {"status": "Paylo.IA rodando! 🐒", "supabase_api": SUPABASE_API}
+    return {"status": "Tino.IA rodando! 🐙", "instancia": EVOLUTION_INSTANCE}
