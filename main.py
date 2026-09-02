@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+OPENCODE_API_KEY = os.getenv("OPENCODE_API_KEY", "")
+OPENCODE_MODEL = os.getenv("OPENCODE_MODEL", "deepseek-v4-flash")
+OPENCODE_BASE_URL = os.getenv("OPENCODE_BASE_URL", "https://opencode.ai/zen/go/v1")
 EVOLUTION_URL = os.getenv("EVOLUTION_URL", "").rstrip("/")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
@@ -478,9 +481,38 @@ def interpretar_com_regras(mensagem):
 
     return {"tipo": "ajuda"}
 
+def interpretar_com_llm(mensagem):
+    """Interpreta via gateway OpenCode (compatível com OpenAI)."""
+    r = httpx.post(
+        f"{OPENCODE_BASE_URL}/chat/completions",
+        headers={"Authorization": f"Bearer {OPENCODE_API_KEY}",
+                 "Content-Type": "application/json"},
+        json={
+            "model": OPENCODE_MODEL,
+            "max_tokens": 400,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": mensagem}
+            ]
+        },
+        timeout=30
+    )
+    r.raise_for_status()
+    texto = r.json()["choices"][0]["message"]["content"].strip()
+    if texto.startswith("```"):
+        texto = texto.split("```")[1]
+        if texto.startswith("json"):
+            texto = texto[4:]
+    return json.loads(texto.strip())
+
 def interpretar_mensagem(mensagem):
-    """Usa Claude se ANTHROPIC_API_KEY estiver configurada; senão, usa regras locais."""
-    if ANTHROPIC_API_KEY:
+    """Usa o gateway OpenCode (ou Claude) se configurado; senão, usa regras locais."""
+    if OPENCODE_API_KEY:
+        try:
+            return interpretar_com_llm(mensagem)
+        except Exception as e:
+            logger.warning(f"OpenCode falhou, usando regras: {e}")
+    elif ANTHROPIC_API_KEY:
         try:
             return interpretar_com_claude(mensagem)
         except Exception as e:
@@ -788,6 +820,24 @@ def extrair_texto(message):
 # ============================================================
 # WEBHOOK
 # ============================================================
+_owner_jid = None
+
+def obter_owner_jid():
+    """Retorna o JID do dono da instância (usado para aceitar auto-mensagens)."""
+    global _owner_jid
+    if _owner_jid:
+        return _owner_jid
+    try:
+        r = httpx.get(f"{EVOLUTION_URL}/instance/fetchInstances",
+                      headers={"apikey": EVOLUTION_API_KEY}, timeout=10)
+        for inst in r.json():
+            if inst.get("instanceName") == EVOLUTION_INSTANCE:
+                _owner_jid = inst.get("ownerJid")
+                break
+    except Exception as e:
+        logger.warning(f"Não foi possível obter ownerJid: {e}")
+    return _owner_jid
+
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -800,12 +850,16 @@ async def webhook(request: Request):
 
     data = payload.get("data", {})
     key = data.get("key", {})
-    if key.get("fromMe"):
-        return {"status": "ignored"}
-
     telefone = key.get("remoteJid", "").split("@")[0]
     if not telefone:
         return {"status": "ignored"}
+
+    # Ignora mensagens enviadas pela própria instância, exceto auto-mensagens
+    # (chat "mensagens com você mesmo"), que são como o dono testa o bot.
+    if key.get("fromMe"):
+        owner = obter_owner_jid() or ""
+        if telefone != owner.split("@")[0]:
+            return {"status": "ignored"}
 
     mensagem = extrair_texto(data.get("message", {}))
     if not mensagem:
