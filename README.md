@@ -42,10 +42,12 @@ São **16 intenções** distintas reconhecidas a partir de texto livre.
 
 ## Como funciona a interpretação
 
-O bot funciona em **dois modos**:
+O Tino é um **agente conversacional**: a IA responde com independência, não com respostas prontas.
 
-- **IA (padrão)** — usa o gateway OpenCode (`opencode.ai/zen/go/v1`) com o modelo `mimo-v2.5` (assinatura Go, custo fixo e super econômico) para interpretar mensagens em linguagem natural e extrair o JSON da intenção.
-- **Regras locais (fallback)** — motor de regex em Python que reconhece as 16 intenções sem custo e sem internet. Ativa automaticamente se a IA falhar ou se nenhuma chave estiver configurada.
+- **Agente com ferramentas** — o modelo (MiMo-V2.5 via gateway OpenCode Go) recebe a mensagem com o histórico da conversa e decide sozinho: conversar naturalmente (dicas, insights, papo) ou chamar ferramentas que consultam os **dados reais** do usuário (`relatorio`, `saldo`, `comparativo`, `registrar_gasto`, `definir_meta`, `ver_lembretes`...). Ele mesmo monta a resposta, incluindo observações personalizadas.
+- **Memória** — as últimas 10 mensagens de cada usuário entram no contexto, então o agente mantém o assunto e retoma conversas.
+- **Confirmação antes de remover** — antes de apagar qualquer gasto ou lembrete, o agente pergunta e aguarda o "sim".
+- **Regras locais (fallback)** — motor de regex em Python que reconhece as 16 intenções sem custo. Ativa automaticamente se a IA falhar ou se nenhuma chave estiver configurada.
 
 ## Arquitetura
 
@@ -64,10 +66,9 @@ flowchart LR
 O fluxo de uma mensagem:
 
 1. **Evolution API** recebe a mensagem no WhatsApp e faz um `POST` no endpoint `/webhook` com o payload JSON do evento `messages.upsert` (texto em `data.message.conversation` / `extendedTextMessage`, remetente em `data.key.remoteJid`).
-2. A **camada de interpretação** decide a intenção: pela **API do gateway OpenCode** (`mimo-v2.5`) com um system prompt que define as 16 intenções e força saída em JSON puro, ou, se indisponível, pelas **regras locais**.
-3. O **roteador de intenção** despacha pro handler correspondente, que executa a lógica de negócio e as operações no banco.
-4. O **banco** PostgreSQL é acessado via `psycopg2` (pool de conexões), com filtros por telefone para isolar os dados de cada usuário.
-5. A resposta é enviada de volta pelo **Evolution API** via `POST /message/sendText/{instancia}`.
+2. O **agente** monta o contexto (system prompt + últimas 10 mensagens do usuário) e chama a IA. Se o modelo pedir uma ferramenta, ela é executada (consultando ou gravando no banco) e o resultado volta para a IA, que monta a resposta final.
+3. O **banco** PostgreSQL é acessado via `psycopg2` (pool de conexões), com filtros por telefone para isolar os dados de cada usuário.
+4. A resposta é enviada de volta pelo **Evolution API** via `POST /message/sendText/{instancia}`.
 
 O telefone do remetente funciona como chave de particionamento: toda consulta filtra por `telefone`, então múltiplos usuários compartilham as mesmas tabelas sem enxergar os dados uns dos outros. A tabela `usuarios` registra cada número na primeira mensagem e mede a atividade (base para cobrança futura).
 
@@ -76,7 +77,7 @@ O telefone do remetente funciona como chave de particionamento: toda consulta fi
 | Camada | Tecnologia |
 |--------|------------|
 | API | FastAPI + Uvicorn |
-| Interpretação | Gateway OpenCode (mimo-v2.5) + fallback por regras (regex) |
+| Agente | MiMo-V2.5 via gateway OpenCode Go (function calling) + fallback por regras |
 | Banco de dados | PostgreSQL 16 (Docker) |
 | Mensageria | Evolution API (WhatsApp) via Docker |
 | Cliente HTTP | httpx |
@@ -200,6 +201,14 @@ create table usuarios (
   criado_em       timestamptz default now(),
   ultima_mensagem timestamptz,
   total_mensagens integer     default 0
+);
+
+create table conversas (
+  id        bigserial primary key,
+  telefone  text           not null,
+  papel     text           not null,
+  conteudo  text           not null,
+  criado_em timestamptz default now()
 );
 ```
 

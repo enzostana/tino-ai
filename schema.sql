@@ -44,3 +44,13 @@ create index if not exists idx_gastos_telefone on gastos (telefone);
 create index if not exists idx_receitas_telefone on receitas (telefone);
 create index if not exists idx_metas_telefone on metas (telefone);
 create index if not exists idx_lembretes_telefone on lembretes (telefone);
+
+create table if not exists conversas (
+  id        bigserial primary key,
+  telefone  text           not null,
+  papel     text           not null,
+  conteudo  text           not null,
+  criado_em timestamptz default now()
+);
+
+create index if not exists idx_conversas_telefone on conversas (telefone, id desc);

@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timedelta
 import httpx
 import logging
+from decimal import Decimal
 from psycopg2 import pool
 
 logging.basicConfig(level=logging.INFO)
@@ -700,6 +701,26 @@ def atualizar_atividade(telefone, nome):
         (nome or "", telefone)
     )
 
+def buscar_conversas(telefone, limite=10):
+    """Últimas mensagens do usuário (mais antigas primeiro)."""
+    linhas = query(
+        "SELECT papel, conteudo FROM conversas WHERE telefone = %s "
+        "ORDER BY id DESC LIMIT %s",
+        (telefone, limite)
+    )
+    return linhas[::-1]
+
+def salvar_conversa(telefone, papel, conteudo):
+    query(
+        "INSERT INTO conversas (telefone, papel, conteudo) VALUES (%s, %s, %s)",
+        (telefone, papel, conteudo)
+    )
+    query(
+        "DELETE FROM conversas WHERE telefone = %s AND id NOT IN "
+        "(SELECT id FROM conversas WHERE telefone = %s ORDER BY id DESC LIMIT 50)",
+        (telefone, telefone)
+    )
+
 # ============================================================
 # AJUDA
 # ============================================================
@@ -761,6 +782,309 @@ Basta escrever como se falasse com um amigo. Veja exemplos:
 • "remover último" / "remover uber"
 
 Mande *"ajuda"* a qualquer momento para ver os comandos. Vamos lá! 😊"""
+
+# ============================================================
+# AGENTE CONVERSACIONAL
+# ============================================================
+AGENT_SYSTEM_PROMPT = """Você é o Tino.IA 🐙, assistente financeiro pessoal que atende no WhatsApp. Você é amigo próximo e consultor financeiro do usuário.
+
+Suas diretrizes:
+
+1. **Personalidade**: simpático, direto, português brasileiro informal. Use markdown do WhatsApp (*negrito* para destaques) e emojis com moderação.
+
+2. **Dados reais**: para responder qualquer pergunta sobre gastos, receitas, saldo, metas, lembretes ou histórico, SEMPRE use as ferramentas disponíveis. Nunca invente números nem afirme valores sem consultar as ferramentas.
+
+3. **Conversa livre**: você pode conversar sobre assuntos gerais, dar conselhos, motivar e puxar assunto. Quando o assunto envolver as finanças da pessoa, consulte as ferramentas.
+
+4. **Registros**: quando o usuário disser que gastou ou recebeu, use a ferramenta correspondente. Se faltar alguma informação (ex: forma de pagamento), registre com o que houver e depois mencione o que ficou sem preencher.
+
+5. **Remoção (IMPORTANTE)**: antes de remover qualquer gasto ou lembrete, pergunte ao usuário confirmando o item exato (descrição, valor, categoria). Aguarde a confirmação na próxima mensagem. SÓ execute a remoção após o usuário confirmar explicitamente.
+
+6. **Insights**: ao consultar dados, aponte observações úteis (maior categoria de gasto, meta próxima do limite, variação em relação ao mês anterior).
+
+7. **Dicas**: ofereça dicas de economia personalizadas baseadas nos dados reais, quando fizer sentido.
+
+8. **Ajuda**: se o usuário pedir ajuda, liste comandos úteis: "uber 27", "almoço 32 no pix", "recebi salário 3000", "resumo", "resumo da semana", "saldo", "comparar meses", "meta alimentação 300", "metas", "lembrete aluguel 1200 dia 5", "lembretes", "remover último", "remover uber", "últimos gastos".
+
+9. **Respostas**: respostas curtas e diretas para WhatsApp (máx. ~10 linhas), a menos que o usuário peça detalhes."""
+
+FERRAMENTAS = [
+    {"type": "function", "function": {
+        "name": "registrar_gasto",
+        "description": "Registra um gasto do usuário no banco de dados.",
+        "parameters": {"type": "object", "properties": {
+            "descricao": {"type": "string", "description": "Descrição curta do gasto (ex: uber, almoço, mercado)"},
+            "valor": {"type": "number", "description": "Valor em reais"},
+            "categoria": {"type": "string", "enum": ["Alimentação", "Transporte", "Lazer", "Saúde", "Moradia", "Educação", "Vestuário", "Outros"]},
+            "forma_pagamento": {"type": "string", "enum": ["pix", "débito", "crédito", "cartão", "dinheiro", "boleto", "transferência", "não informado"]}
+        }, "required": ["descricao", "valor", "categoria"]}
+    }},
+    {"type": "function", "function": {
+        "name": "registrar_receita",
+        "description": "Registra uma receita do usuário no banco de dados.",
+        "parameters": {"type": "object", "properties": {
+            "descricao": {"type": "string"},
+            "valor": {"type": "number"},
+            "categoria": {"type": "string", "enum": ["Salário", "Freelance", "Investimento", "Presente", "Outros"]}
+        }, "required": ["descricao", "valor", "categoria"]}
+    }},
+    {"type": "function", "function": {
+        "name": "remover_gasto",
+        "description": "Remove um gasto. Sem descricao e sem valor, remove o último. Se a descricao for uma categoria, remove por categoria (valor opcional). USE SOMENTE APÓS O USUÁRIO CONFIRMAR.",
+        "parameters": {"type": "object", "properties": {
+            "descricao": {"type": "string", "description": "Descrição ou categoria do gasto a remover (opcional)"},
+            "valor": {"type": "number", "description": "Valor do gasto a remover (opcional)"}
+        }}
+    }},
+    {"type": "function", "function": {
+        "name": "remover_lembrete",
+        "description": "Remove um lembrete de conta fixa pela descrição. USE SOMENTE APÓS O USUÁRIO CONFIRMAR.",
+        "parameters": {"type": "object", "properties": {
+            "descricao": {"type": "string"}
+        }, "required": ["descricao"]}
+    }},
+    {"type": "function", "function": {
+        "name": "relatorio",
+        "description": "Retorna os dados de gastos do usuário em um período (dados brutos).",
+        "parameters": {"type": "object", "properties": {
+            "periodo": {"type": "string", "enum": ["hoje", "semana", "mes"]}
+        }, "required": ["periodo"]}
+    }},
+    {"type": "function", "function": {
+        "name": "saldo",
+        "description": "Retorna receitas, gastos e saldo de um período (dados brutos).",
+        "parameters": {"type": "object", "properties": {
+            "periodo": {"type": "string", "enum": ["hoje", "semana", "mes"]}
+        }, "required": ["periodo"]}
+    }},
+    {"type": "function", "function": {
+        "name": "comparativo",
+        "description": "Compara os gastos do mês atual com o mês anterior (dados brutos)."
+    }},
+    {"type": "function", "function": {
+        "name": "historico",
+        "description": "Retorna os últimos gastos registrados do usuário (dados brutos)."
+    }},
+    {"type": "function", "function": {
+        "name": "ver_metas",
+        "description": "Retorna as metas mensais do usuário e o quanto já gastou em cada categoria (dados brutos)."
+    }},
+    {"type": "function", "function": {
+        "name": "definir_meta",
+        "description": "Define ou atualiza o limite mensal de gastos de uma categoria.",
+        "parameters": {"type": "object", "properties": {
+            "categoria": {"type": "string", "enum": ["Alimentação", "Transporte", "Lazer", "Saúde", "Moradia", "Educação", "Vestuário", "Outros"]},
+            "limite": {"type": "number"}
+        }, "required": ["categoria", "limite"]}
+    }},
+    {"type": "function", "function": {
+        "name": "ver_lembretes",
+        "description": "Retorna os lembretes de contas fixas do usuário (dados brutos)."
+    }},
+    {"type": "function", "function": {
+        "name": "adicionar_lembrete",
+        "description": "Adiciona um lembrete de conta fixa com dia de vencimento mensal.",
+        "parameters": {"type": "object", "properties": {
+            "descricao": {"type": "string"},
+            "valor": {"type": "number"},
+            "dia_vencimento": {"type": "integer", "minimum": 1, "maximum": 31}
+        }, "required": ["descricao", "valor", "dia_vencimento"]}
+    }},
+]
+
+def dados_relatorio(telefone, periodo):
+    gastos = buscar_gastos_periodo(telefone, periodo)
+    por_cat = {}
+    for g in gastos:
+        por_cat[g["categoria"]] = por_cat.get(g["categoria"], 0) + g["valor"]
+    metas = buscar_metas(telefone)
+    alertas = []
+    for meta in metas:
+        gasto_cat = por_cat.get(meta["categoria"], 0)
+        if meta["limite"] > 0:
+            pct = (gasto_cat / meta["limite"]) * 100
+            if pct >= 100:
+                alertas.append({"categoria": meta["categoria"], "pct": pct, "limite": meta["limite"]})
+            elif pct >= 80:
+                alertas.append({"categoria": meta["categoria"], "pct": pct, "limite": meta["limite"]})
+    return {"periodo": periodo, "total": sum(g["valor"] for g in gastos),
+            "quantidade": len(gastos), "por_categoria": por_cat, "alertas_metas": alertas}
+
+def dados_saldo(telefone, periodo):
+    gastos = buscar_gastos_periodo(telefone, periodo)
+    receitas = buscar_receitas_periodo(telefone, periodo)
+    total_gastos = sum(g["valor"] for g in gastos)
+    total_receitas = sum(r["valor"] for r in receitas)
+    return {"periodo": periodo, "receitas": total_receitas, "gastos": total_gastos,
+            "saldo": total_receitas - total_gastos}
+
+def dados_comparativo(telefone):
+    atual = buscar_gastos_mes_offset(telefone, 0)
+    passado = buscar_gastos_mes_offset(telefone, 1)
+    cats_atual = {}
+    for g in atual:
+        cats_atual[g["categoria"]] = cats_atual.get(g["categoria"], 0) + g["valor"]
+    cats_passado = {}
+    for g in passado:
+        cats_passado[g["categoria"]] = cats_passado.get(g["categoria"], 0) + g["valor"]
+    return {"total_mes_atual": sum(g["valor"] for g in atual),
+            "total_mes_passado": sum(g["valor"] for g in passado),
+            "por_categoria_atual": cats_atual, "por_categoria_passado": cats_passado}
+
+def dados_historico(telefone):
+    gastos = listar_ultimos_gastos(telefone)
+    return [{"id": g["id"], "descricao": g["descricao"], "valor": g["valor"],
+             "categoria": g["categoria"], "forma_pagamento": g.get("forma_pagamento", "não informado"),
+             "data": g["data"]} for g in gastos]
+
+def dados_ver_metas(telefone):
+    metas = buscar_metas(telefone)
+    gastos = buscar_gastos_mes_offset(telefone, 0)
+    por_cat = {}
+    for g in gastos:
+        por_cat[g["categoria"]] = por_cat.get(g["categoria"], 0) + g["valor"]
+    resultado = []
+    for meta in metas:
+        gasto = por_cat.get(meta["categoria"], 0)
+        pct = (gasto / meta["limite"]) * 100 if meta["limite"] > 0 else 0
+        resultado.append({"categoria": meta["categoria"], "limite": meta["limite"],
+                          "gasto": gasto, "pct": round(pct, 1)})
+    return resultado
+
+def dados_ver_lembretes(telefone):
+    lembretes = buscar_lembretes(telefone)
+    hoje = datetime.now().day
+    resultado = []
+    for l in lembretes:
+        dias = l["dia_vencimento"] - hoje
+        if dias < 0:
+            dias += 30
+        resultado.append({"descricao": l["descricao"], "valor": l["valor"],
+                          "dia_vencimento": l["dia_vencimento"], "dias_restantes": dias})
+    return resultado
+
+def executar_ferramenta(nome, args, telefone):
+    if nome == "registrar_gasto":
+        gid = salvar_gasto(args["descricao"], args["valor"], args["categoria"],
+                           args.get("forma_pagamento", "não informado"), telefone)
+        gastos_mes = buscar_gastos_mes_offset(telefone, 0)
+        por_cat = {}
+        for g in gastos_mes:
+            por_cat[g["categoria"]] = por_cat.get(g["categoria"], 0) + g["valor"]
+        alerta = None
+        for meta in buscar_metas(telefone):
+            if meta["categoria"].lower() == args["categoria"].lower():
+                gasto_cat = por_cat.get(args["categoria"], 0)
+                pct = (gasto_cat / meta["limite"]) * 100 if meta["limite"] > 0 else 0
+                if pct >= 100:
+                    alerta = f"ultrapassou 100% do limite de {args['categoria']}"
+                elif pct >= 80:
+                    alerta = f"usou {pct:.0f}% do limite de {args['categoria']}"
+        return {"status": "ok", "id": gid, "descricao": args["descricao"],
+                "valor": args["valor"], "categoria": args["categoria"],
+                "alerta_meta": alerta}
+
+    if nome == "registrar_receita":
+        rec_id = salvar_receita(args["descricao"], args["valor"], args.get("categoria", "Outros"), telefone)
+        return {"status": "ok", "id": rec_id, "descricao": args["descricao"],
+                "valor": args["valor"], "categoria": args.get("categoria", "Outros")}
+
+    if nome == "remover_gasto":
+        desc = args.get("descricao", "")
+        valor = args.get("valor")
+        if not desc and valor is None:
+            g = remover_ultimo_gasto(telefone)
+        elif desc and nome_categoria_no_texto(desc):
+            g = remover_gasto_por_categoria(telefone, desc, valor)
+        elif desc:
+            g = remover_gasto_por_descricao(telefone, desc)
+        else:
+            g = remover_ultimo_gasto(telefone)
+        if not g:
+            return {"status": "nao_encontrado"}
+        return {"status": "removido", "descricao": g["descricao"], "valor": g["valor"],
+                "categoria": g["categoria"]}
+
+    if nome == "remover_lembrete":
+        l = remover_lembrete(telefone, args.get("descricao", ""))
+        if not l:
+            return {"status": "nao_encontrado"}
+        return {"status": "removido", "descricao": l["descricao"], "valor": l["valor"]}
+
+    if nome == "relatorio":
+        return dados_relatorio(telefone, args.get("periodo", "mes"))
+
+    if nome == "saldo":
+        return dados_saldo(telefone, args.get("periodo", "mes"))
+
+    if nome == "comparativo":
+        return dados_comparativo(telefone)
+
+    if nome == "historico":
+        return dados_historico(telefone)
+
+    if nome == "ver_metas":
+        return dados_ver_metas(telefone)
+
+    if nome == "definir_meta":
+        status = salvar_meta(telefone, args["categoria"], args["limite"])
+        return {"status": status, "categoria": args["categoria"], "limite": args["limite"]}
+
+    if nome == "ver_lembretes":
+        return dados_ver_lembretes(telefone)
+
+    if nome == "adicionar_lembrete":
+        lid = salvar_lembrete(telefone, args["descricao"], args["valor"], args["dia_vencimento"])
+        return {"status": "ok", "id": lid, "descricao": args["descricao"],
+                "valor": args["valor"], "dia_vencimento": args["dia_vencimento"]}
+
+    return {"erro": f"ferramenta desconhecida: {nome}"}
+
+def serializar_resultado(resultado):
+    """Serializa o resultado de uma ferramenta para JSON (Decimal -> float)."""
+    def converter(o):
+        if isinstance(o, Decimal):
+            return float(o)
+        if isinstance(o, dict):
+            return {k: converter(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [converter(i) for i in o]
+        return o
+    return json.dumps(converter(resultado), ensure_ascii=False, default=str)
+
+def chamar_llm(messages, ferramentas=None):
+    body = {"model": OPENCODE_MODEL, "max_tokens": 600, "messages": messages}
+    if ferramentas:
+        body["tools"] = ferramentas
+    r = httpx.post(f"{OPENCODE_BASE_URL}/chat/completions",
+                   headers={"Authorization": f"Bearer {OPENCODE_API_KEY}",
+                            "Content-Type": "application/json"},
+                   json=body, timeout=40)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]
+
+def agente_conversacional(telefone, mensagem):
+    """Loop do agente: chama o LLM, executa ferramentas até a resposta final."""
+    messages = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
+    messages += [{"role": h["papel"], "content": h["conteudo"]} for h in buscar_conversas(telefone)]
+    messages.append({"role": "user", "content": mensagem})
+
+    for _ in range(4):
+        msg = chamar_llm(messages, FERRAMENTAS)
+        tool_calls = msg.get("tool_calls")
+        if not tool_calls:
+            return msg.get("content") or MENSAGEM_AJUDA
+        for tc in tool_calls:
+            try:
+                args = json.loads(tc["function"].get("arguments") or "{}")
+                resultado = executar_ferramenta(tc["function"]["name"], args, telefone)
+            except Exception as e:
+                logger.error(f"Falha na ferramenta {tc['function'].get('name')}: {e}")
+                resultado = {"erro": str(e)}
+            messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+            messages.append({"role": "tool", "tool_call_id": tc["id"],
+                             "content": serializar_resultado(resultado)})
+    return "⚠️ Não consegui finalizar a resposta agora. Tente novamente em instantes."
 
 # ============================================================
 # PROCESSAMENTO
@@ -924,10 +1248,17 @@ async def webhook(request: Request):
         resposta = MENSAGEM_BEM_VINDO
     else:
         try:
-            resposta = processar_mensagem(mensagem, telefone)
+            resposta = agente_conversacional(telefone, mensagem)
         except Exception as e:
-            logger.error(f"Erro: {e}")
-            resposta = "⚠️ Não entendi sua mensagem.\n\nMande 'ajuda' para ver os comandos disponíveis."
+            logger.error(f"Agente falhou: {e}")
+            try:
+                resposta = processar_mensagem(mensagem, telefone)
+            except Exception as e2:
+                logger.error(f"Fallback falhou: {e2}")
+                resposta = "⚠️ Não entendi sua mensagem.\n\nMande 'ajuda' para ver os comandos disponíveis."
+
+    salvar_conversa(telefone, "user", mensagem)
+    salvar_conversa(telefone, "assistant", resposta)
 
     enviar_whatsapp(telefone, resposta)
     return {"status": "ok"}
