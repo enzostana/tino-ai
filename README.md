@@ -36,6 +36,8 @@ Tino:  ✅ Gasto registrado! (#185)
 
 **Correções** — remover o último lançamento, remover por descrição ou por categoria, e consultar o histórico recente.
 
+**Boas-vindas automáticas** — quando uma pessoa envia a primeira mensagem, o Tino se apresenta e mostra os comandos úteis com exemplos de uso. Cada número de WhatsApp é registrado como usuário, com contagem de mensagens e data de última atividade (base pronta para planos pagos no futuro).
+
 São **16 intenções** distintas reconhecidas a partir de texto livre.
 
 ## Como funciona a interpretação
@@ -67,7 +69,7 @@ O fluxo de uma mensagem:
 4. O **banco** PostgreSQL é acessado via `psycopg2` (pool de conexões), com filtros por telefone para isolar os dados de cada usuário.
 5. A resposta é enviada de volta pelo **Evolution API** via `POST /message/sendText/{instancia}`.
 
-O telefone do remetente funciona como chave de particionamento: toda consulta filtra por `telefone`, então múltiplos usuários compartilham as mesmas tabelas sem enxergar os dados uns dos outros.
+O telefone do remetente funciona como chave de particionamento: toda consulta filtra por `telefone`, então múltiplos usuários compartilham as mesmas tabelas sem enxergar os dados uns dos outros. A tabela `usuarios` registra cada número na primeira mensagem e mede a atividade (base para cobrança futura).
 
 ## Stack
 
@@ -190,6 +192,14 @@ create table lembretes (
   descricao       text      not null,
   valor           numeric   not null,
   dia_vencimento  int       not null
+);
+
+create table usuarios (
+  telefone        text primary key,
+  nome            text,
+  criado_em       timestamptz default now(),
+  ultima_mensagem timestamptz,
+  total_mensagens integer     default 0
 );
 ```
 

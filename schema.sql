@@ -31,3 +31,16 @@ create table if not exists lembretes (
   valor           numeric   not null,
   dia_vencimento  int       not null
 );
+
+create table if not exists usuarios (
+  telefone        text primary key,
+  nome            text,
+  criado_em       timestamptz default now(),
+  ultima_mensagem timestamptz,
+  total_mensagens integer     default 0
+);
+
+create index if not exists idx_gastos_telefone on gastos (telefone);
+create index if not exists idx_receitas_telefone on receitas (telefone);
+create index if not exists idx_metas_telefone on metas (telefone);
+create index if not exists idx_lembretes_telefone on lembretes (telefone);

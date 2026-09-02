@@ -683,6 +683,24 @@ def gerar_historico(telefone):
     return "\n".join(linhas)
 
 # ============================================================
+# USUÁRIOS
+# ============================================================
+def registrar_usuario(telefone, nome):
+    """Registra o usuário se for a primeira mensagem. Retorna True se for novo."""
+    existente = query("SELECT telefone FROM usuarios WHERE telefone = %s", (telefone,))
+    if not existente:
+        query("INSERT INTO usuarios (telefone, nome) VALUES (%s, %s)", (telefone, nome or ""))
+        return True
+    return False
+
+def atualizar_atividade(telefone, nome):
+    query(
+        "UPDATE usuarios SET nome = %s, ultima_mensagem = now(), "
+        "total_mensagens = total_mensagens + 1 WHERE telefone = %s",
+        (nome or "", telefone)
+    )
+
+# ============================================================
 # AJUDA
 # ============================================================
 MENSAGEM_AJUDA = """🐙 *Tino.IA — Seu assistente financeiro!*
@@ -713,6 +731,36 @@ MENSAGEM_AJUDA = """🐙 *Tino.IA — Seu assistente financeiro!*
 • "remover uber" / "remover lazer"
 
 *💡 Escreva naturalmente, eu entendo! 😊*"""
+
+MENSAGEM_BEM_VINDO = """👋 *Oi! Eu sou o Tino.IA 🐙*, seu assistente financeiro no WhatsApp!
+
+Basta escrever como se falasse com um amigo. Veja exemplos:
+
+*📝 Gastos:*
+• "uber 27" / "almoço 32 no pix"
+• "mercado 150 débito"
+
+*📈 Receitas:*
+• "recebi salário 3000"
+• "freelance 500"
+
+*📊 Relatórios:*
+• "resumo" / "resumo da semana"
+• "saldo" / "quanto sobrou"
+• "comparar meses"
+
+*🎯 Metas:*
+• "meta alimentação 300"
+• "metas"
+
+*🔔 Lembretes:*
+• "lembrete aluguel 1200 dia 5"
+• "lembretes"
+
+*🗑️ Correções:*
+• "remover último" / "remover uber"
+
+Mande *"ajuda"* a qualquer momento para ver os comandos. Vamos lá! 😊"""
 
 # ============================================================
 # PROCESSAMENTO
@@ -866,13 +914,20 @@ async def webhook(request: Request):
         return {"status": "ignored"}
     mensagem = mensagem.strip()
 
-    logger.info(f"Mensagem de {telefone}: {mensagem}")
+    nome = data.get("pushName", "")
+    eh_novo = registrar_usuario(telefone, nome)
+    atualizar_atividade(telefone, nome)
 
-    try:
-        resposta = processar_mensagem(mensagem, telefone)
-    except Exception as e:
-        logger.error(f"Erro: {e}")
-        resposta = "⚠️ Não entendi sua mensagem.\n\nMande 'ajuda' para ver os comandos disponíveis."
+    logger.info(f"Mensagem de {telefone} ({nome}): {mensagem}")
+
+    if eh_novo:
+        resposta = MENSAGEM_BEM_VINDO
+    else:
+        try:
+            resposta = processar_mensagem(mensagem, telefone)
+        except Exception as e:
+            logger.error(f"Erro: {e}")
+            resposta = "⚠️ Não entendi sua mensagem.\n\nMande 'ajuda' para ver os comandos disponíveis."
 
     enviar_whatsapp(telefone, resposta)
     return {"status": "ok"}
