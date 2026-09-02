@@ -48,8 +48,8 @@ services:
     environment:
       TZ: America/Sao_Paulo
       OPENCODE_API_KEY: ${OPENCODE_API_KEY}
-      OPENCODE_MODEL: ${OPENCODE_MODEL:-mimo-v2.5}
-      OPENCODE_BASE_URL: ${OPENCODE_BASE_URL:-https://opencode.ai/zen/go/v1}
+      OPENCODE_MODEL: ${OPENCODE_MODEL:-mimo-v2.5-free}
+      OPENCODE_BASE_URL: ${OPENCODE_BASE_URL:-https://opencode.ai/zen/v1}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       EVOLUTION_URL: http://evolution-api:8080
       EVOLUTION_INSTANCE: ${EVOLUTION_INSTANCE}

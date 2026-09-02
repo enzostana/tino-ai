@@ -157,8 +157,8 @@ curl -X POST http://localhost:8000/webhook -H "Content-Type: application/json" -
 | `EVOLUTION_API_KEY` | Sim | Token de autenticação da Evolution API |
 | `POSTGRES_PASSWORD` | Sim | Senha do banco PostgreSQL |
 | `OPENCODE_API_KEY` | Não | Chave do gateway OpenCode (Zen/Go). Sem ela, o bot usa apenas as regras locais |
-| `OPENCODE_MODEL` | Não | Modelo no gateway (padrão: `mimo-v2.5`) |
-| `OPENCODE_BASE_URL` | Não | Endpoint do gateway (padrão: `https://opencode.ai/zen/go/v1`) |
+| `OPENCODE_MODEL` | Não | Modelo no gateway (padrão: `mimo-v2.5-free`) |
+| `OPENCODE_BASE_URL` | Não | Endpoint do gateway (padrão: `https://opencode.ai/zen/v1`) |
 | `WEBHOOK_TOKEN` | Não | Segredo validado no header `x-tino-token` do webhook (recomendado em produção) |
 | `NUM_WORKERS` | Não | Threads de processamento em background (padrão: 4) |
 
