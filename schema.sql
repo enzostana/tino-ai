@@ -54,3 +54,11 @@ create table if not exists conversas (
 );
 
 create index if not exists idx_conversas_telefone on conversas (telefone, id desc);
+
+create table if not exists mensagens_processadas (
+  id        text primary key,
+  telefone  text           not null default '',
+  criado_em timestamptz default now()
+);
+
+create index if not exists idx_mensagens_criado on mensagens_processadas (criado_em);

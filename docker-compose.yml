@@ -46,6 +46,7 @@ services:
     ports:
       - "8000:8000"
     environment:
+      TZ: America/Sao_Paulo
       OPENCODE_API_KEY: ${OPENCODE_API_KEY}
       OPENCODE_MODEL: ${OPENCODE_MODEL:-mimo-v2.5}
       OPENCODE_BASE_URL: ${OPENCODE_BASE_URL:-https://opencode.ai/zen/go/v1}
@@ -54,9 +55,17 @@ services:
       EVOLUTION_INSTANCE: ${EVOLUTION_INSTANCE}
       EVOLUTION_API_KEY: ${EVOLUTION_API_KEY}
       DATABASE_URL: postgresql://tino:${POSTGRES_PASSWORD}@db:5432/tino
+      WEBHOOK_TOKEN: ${WEBHOOK_TOKEN}
+      NUM_WORKERS: ${NUM_WORKERS:-4}
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
 volumes:
   tino-db-data:
